@@ -1,6 +1,7 @@
 const Booking   = require('../models/Booking');
 const User      = require('../models/User');
 const sendEmail = require('../utils/sendEmail');
+const { getTodayLocalStr } = require('../utils/dateUtils');
 
 const TIME_SLOTS = [
   '9:00AM - 11:00AM',
@@ -9,7 +10,7 @@ const TIME_SLOTS = [
   '4:00PM - 6:00PM',
 ];
 
-const ACTIVE_STATUSES = ['pending', 'confirmed', 'confirmed-paid', 'confirmed-unpaid', 'in-progress'];
+const ACTIVE_STATUSES = ['pending', 'confirmed', 'in-progress'];
 
 // Returns true if the service needs a team of 3 (Home Cleaning, Sofa/Mattress)
 // Laundry and Curtain → single staff only
@@ -46,6 +47,29 @@ const pickLeastLoaded = async (candidates, count = 1) => {
   return withLoad.slice(0, count).map(x => x.staff);
 };
 
+// Parses a time-slot string like "9:00AM - 11:00AM" and returns its start as 24-hour { h, m }
+const parseSlotStartTime = (timeStr) => {
+  const start = (timeStr || '').split(' - ')[0].trim();
+  const match = start.match(/(\d+):(\d+)(AM|PM)/i);
+  if (!match) return null;
+  let h = parseInt(match[1], 10);
+  const m = parseInt(match[2], 10);
+  const period = match[3].toUpperCase();
+  if (period === 'PM' && h !== 12) h += 12;
+  if (period === 'AM' && h === 12) h = 0;
+  return { h, m };
+};
+
+// Builds the Date the booking is actually scheduled to start (server-local time)
+const getScheduledDateTime = (booking) => {
+  if (!booking.date || !booking.time) return null;
+  const slot = parseSlotStartTime(booking.time);
+  if (!slot) return null;
+  const [year, month, day] = booking.date.split('-').map(Number);
+  if (!year || !month || !day) return null;
+  return new Date(year, month - 1, day, slot.h, slot.m, 0);
+};
+
 // Returns the set of staff IDs already assigned to any booking on the same date+time
 // (excludes the booking itself so reschedule doesn't block its own staff)
 const getBusyStaffIds = async (date, time, excludeBookingId = null) => {
@@ -67,7 +91,7 @@ const autoAssignBooking = async (booking) => {
   try {
     const isTeam   = requiresTeam(booking);
     const spec     = getRequiredSpecialization(booking);
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getTodayLocalStr();
     const isToday  = booking.date === todayStr;
 
     // For today → only available staff. For future → any active staff.
@@ -78,7 +102,7 @@ const autoAssignBooking = async (booking) => {
 
     // Only assign spec-matched staff — never fall back to unqualified staff
     const candidates = await User.find({
-      role:            { $in: ['staff', 'cleaner'] },
+      role:            'staff',
       specializations: spec,
       _id:             { $nin: [...busyIds] },
       ...availFilter,
@@ -207,7 +231,7 @@ const getAssignedBookings = async (req, res) => {
         amount:        b.price          || 0,
         paymentMethod: b.paymentMethod  || 'cod',
         customerEmail: b.customerEmail || '',
-        cashReceived:  !!b.cashReceivedAt,
+        cashReceived:  b.paymentStatus === 'paid',
         isTeam:        hasTeam,
         teamMembers:   hasTeam
           ? b.assignedTeam.map(m => ({
@@ -296,14 +320,31 @@ const rescheduleBooking = async (req, res) => {
 };
 
 // cancelBookingfunction─── PATCH /api/bookings/:id/cancel ────────────────────────────
+// Requires a cancellation reason (Uber-style). Also records when the cancellation
+// happened and how many minutes before the scheduled service time it occurred
+// (negative if cancelled after the scheduled time already passed).
 const cancelBooking = async (req, res) => {
   try {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ success: false, message: 'A cancellation reason is required.' });
+    }
+
     const booking = await Booking.findOne({ _id: req.params.id, customerId: req.user._id });
     if (!booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
     if (booking.status === 'cancelled') return res.status(400).json({ success: false, message: 'Booking is already cancelled.' });
     if (booking.status === 'completed') return res.status(400).json({ success: false, message: 'Cannot cancel a completed booking.' });
 
-    booking.status = 'cancelled';
+    const now         = new Date();
+    const scheduledAt = getScheduledDateTime(booking);
+
+    booking.status               = 'cancelled';
+    booking.cancellationReason   = reason.trim();
+    booking.cancelledAt          = now;
+    booking.minutesBeforeService = scheduledAt
+      ? Math.round((scheduledAt.getTime() - now.getTime()) / 60000)
+      : undefined;
+
     await booking.save();
     res.json({ success: true, booking });
   } catch (err) {
@@ -369,8 +410,7 @@ const markCashReceived = async (req, res) => {
     });
     if (!booking) return res.status(404).json({ success: false, message: 'Task not found.' });
 
-    booking.cashReceivedAt = new Date();
-    booking.paymentStatus  = 'paid';
+    booking.paymentStatus = 'paid';
     await booking.save();
     res.json({ success: true, booking });
   } catch (err) {
@@ -402,7 +442,7 @@ const declineTask = async (req, res) => {
     });
 
     const hasTeam  = booking.assignedTeam && booking.assignedTeam.length > 0;
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getTodayLocalStr();
     // For today's bookings only available staff can replace; future tasks use any staff
     const availFilter = booking.date === todayStr ? { isAvailable: true } : {};
 
@@ -433,7 +473,7 @@ const declineTask = async (req, res) => {
       ];
 
       const candidates = await User.find({
-        role: { $in: ['staff', 'cleaner'] },
+        role: 'staff',
         _id:  { $nin: excludeIds },
         ...availFilter,
       });
@@ -455,7 +495,7 @@ const declineTask = async (req, res) => {
     } else {
       //replacementSinglestaffbooking — find a different staff member
       const candidates = await User.find({
-        role: { $in: ['staff', 'cleaner'] },
+        role: 'staff',
         _id:  { $ne: req.user._id },
         ...availFilter,
       });
@@ -489,7 +529,7 @@ const getAllBookings = async (req, res) => {
   try {
     const bookings = await Booking.find({})
       .sort({ createdAt: -1 })
-      .select('bookingId customerName customerEmail serviceName serviceCategory date time status price assignedStaffName assignedTeam needsAdminAttention adminNotificationReason');
+      .select('bookingId customerName customerEmail serviceName serviceCategory date time status price assignedStaffName assignedTeam needsAdminAttention adminNotificationReason cancellationReason cancelledAt minutesBeforeService');
     res.json({ success: true, bookings });
   } catch (err) {
     console.error('getAllBookings error:', err);
@@ -565,13 +605,15 @@ const getNeedsAttention = async (req, res) => {
 };
 
 // ─── PATCH /api/bookings/:id/resolve-attention  (admin) ──────────────────────
+// Only clears the active-attention flag — adminNotificationReason is kept as a
+// permanent record of why this booking was flagged, so it can still be checked
+// later (e.g. "did this booking ever have a staffing problem?").
 const resolveAttention = async (req, res) => {
   try {
     const booking = await Booking.findById(req.params.id);
     if (!booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
 
-    booking.needsAdminAttention     = false;
-    booking.adminNotificationReason = '';
+    booking.needsAdminAttention = false;
     await booking.save();
 
     res.json({ success: true });

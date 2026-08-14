@@ -7,6 +7,7 @@ const {
   rescheduleSchema,
   declineSchema,
   slotCheckSchema,
+  cancelSchema,
 } = require('../validators/bookingValidators');
 const {
   createBooking,
@@ -36,7 +37,7 @@ router.get('/needs-attention',         adminOnly, getNeedsAttention);
 router.post('/',                       validate(createBookingSchema), createBooking);
 router.post('/assign-unassigned',      adminOnly, assignAllUnassigned);
 router.patch('/:id/reschedule',        validate(rescheduleSchema), rescheduleBooking);
-router.patch('/:id/cancel',            cancelBooking);
+router.patch('/:id/cancel',            validate(cancelSchema), cancelBooking);
 router.patch('/:id/start',             startTask);
 router.patch('/:id/complete',          completeTask);
 router.patch('/:id/cash-received',     markCashReceived);

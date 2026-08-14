@@ -1,8 +1,9 @@
 const User    = require('../models/User');
 const Booking = require('../models/Booking');
 const bcrypt  = require('bcryptjs');
+const { getTodayLocalStr } = require('../utils/dateUtils');
 
-const ACTIVE_STATUSES = ['pending', 'confirmed', 'confirmed-paid', 'confirmed-unpaid', 'in-progress'];
+const ACTIVE_STATUSES = ['pending', 'confirmed', 'in-progress'];
 
 // ─── PATCH /api/staff/availability ───────────────────────────────────────────
 // Staff toggles their own availability on/off.
@@ -23,7 +24,7 @@ const toggleAvailability = async (req, res) => {
     if (!staff.isAvailable) {
       // isAvailable is today-only — only reassign TODAY's bookings.
       // Future bookings remain assigned (staff will be available on those dates).
-      const todayStr = new Date().toISOString().split('T')[0];
+      const todayStr = getTodayLocalStr();
 
       // ── Handle team bookings for today ──────────────────────────────────────
       const teamBookings = await Booking.find({
@@ -39,7 +40,7 @@ const toggleAvailability = async (req, res) => {
 
         const currentTeamIds = booking.assignedTeam.map(m => m.staffId);
         const candidates = await User.find({
-          role:        { $in: ['staff', 'cleaner'] },
+          role:        'staff',
           isAvailable: true,
           _id:         { $nin: [...currentTeamIds, staff._id] },
         });
@@ -84,7 +85,7 @@ const toggleAvailability = async (req, res) => {
 
       for (const booking of singleBookings) {
         const candidates = await User.find({
-          role:        { $in: ['staff', 'cleaner'] },
+          role:        'staff',
           isAvailable: true,
           _id:         { $ne: staff._id },
         });
@@ -149,7 +150,7 @@ const createStaff = async (req, res) => {
       address:               address || '',
       password:              'staff123',      // temporary — must change on first login
       role:                  'staff',
-      verified:              true,
+      isVerified:            true,
       requiresPasswordChange: true,
       isAvailable:           status === 'Active',
       specializations:       specifications || [],
@@ -177,7 +178,7 @@ const createStaff = async (req, res) => {
 // Returns all staff with their availability, logs, and completed job counts
 const getAllStaff = async (req, res) => {
   try {
-    const staffList = await User.find({ role: { $in: ['staff', 'cleaner'] } })
+    const staffList = await User.find({ role: 'staff' })
       .select('name email phone isAvailable availabilityLogs role specializations');
 
     // Attach completed job count to each staff member
@@ -228,7 +229,7 @@ const getMyPerformance = async (req, res) => {
     const allBookings       = await Booking.find({ assignedStaffId: staffId });
     const completedBookings = allBookings.filter(b => b.status === 'completed');
     const pendingBookings   = allBookings.filter(b =>
-      ['pending', 'confirmed', 'confirmed-paid', 'confirmed-unpaid', 'in-progress'].includes(b.status)
+      ['pending', 'confirmed', 'in-progress'].includes(b.status)
     );
 
     const totalEarnings  = completedBookings.reduce((sum, b) => sum + (b.price || 0), 0);

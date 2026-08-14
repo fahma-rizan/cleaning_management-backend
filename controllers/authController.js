@@ -36,7 +36,7 @@ const register = async (req, res) => {
     const existing = await User.findOne({ email: email.toLowerCase() });
 
     if (existing) {
-      if (existing.verified) {
+      if (existing.isVerified) {
         return res.status(400).json({
           success: false,
           message: 'This email is already registered. Please Sign In.',
@@ -62,7 +62,7 @@ const register = async (req, res) => {
       phone,
       password,
       role: 'customer',
-      verified: false,
+      isVerified: false,
       otp,
       otpExpiry: new Date(Date.now() + 10 * 60 * 1000),
       loyaltyPoints: 0,
@@ -86,11 +86,11 @@ const verifyOTP = async (req, res) => {
 
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-    if (user.verified) return res.status(400).json({ success: false, message: 'Email already verified.' });
+    if (user.isVerified) return res.status(400).json({ success: false, message: 'Email already verified.' });
     if (user.otp !== otp) return res.status(400).json({ success: false, message: 'Invalid code. Please try again.' });
     if (user.otpExpiry < new Date()) return res.status(400).json({ success: false, message: 'Code has expired. Please request a new one.' });
 
-    user.verified = true;
+    user.isVerified = true;
     user.otp = undefined;
     user.otpExpiry = undefined;
     await user.save();
@@ -106,7 +106,7 @@ const verifyOTP = async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
-        verified: user.verified,
+        isVerified: user.isVerified,
         loyaltyPoints: user.loyaltyPoints,
         badge: user.badge,
       },
@@ -124,7 +124,7 @@ const resendOTP = async (req, res) => {
 
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-    if (user.verified) return res.status(400).json({ success: false, message: 'Email already verified.' });
+    if (user.isVerified) return res.status(400).json({ success: false, message: 'Email already verified.' });
 
     const otp = generateOTP();
     user.otp = otp;
@@ -150,7 +150,7 @@ const login = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Email and password are required.' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const user = await User.findOne({ email: email.toLowerCase() }).select('+password');
     if (!user) {
       return res.status(401).json({ success: false, message: 'Incorrect email or password. Please try again.' });
     }
@@ -161,7 +161,7 @@ const login = async (req, res) => {
     }
 
     // Customers must verify email before login
-    if (!user.verified && user.role === 'customer') {
+    if (!user.isVerified && user.role === 'customer') {
       return res.status(401).json({
         success: false,
         message: 'Please verify your email first.',
@@ -181,7 +181,7 @@ const login = async (req, res) => {
         email: user.email,
         role: user.role,
         adminRole: user.adminRole,
-        verified: user.verified,
+        isVerified: user.isVerified,
         loyaltyPoints: user.loyaltyPoints,
         badge: user.badge,
         requiresPasswordChange: user.requiresPasswordChange,
@@ -286,7 +286,7 @@ const staffChangePassword = async (req, res) => {
       return res.status(400).json({ success: false, message: 'All fields are required.' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const user = await User.findOne({ email: email.toLowerCase() }).select('+password');
     if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
 
     const isMatch = await user.comparePassword(tempPassword);

@@ -41,6 +41,11 @@ const declineSchema = z.object({
   reason: z.string().min(3, 'reason must be at least 3 characters'),
 });
 
+// PATCH /api/bookings/:id/cancel
+const cancelSchema = z.object({
+  reason: z.string().min(3, 'reason must be at least 3 characters'),
+});
+
 // GET /api/bookings/slot-check?date=
 const slotCheckSchema = z.object({
   date: dateField,
@@ -51,4 +56,5 @@ module.exports = {
   rescheduleSchema,
   declineSchema,
   slotCheckSchema,
+  cancelSchema,
 };

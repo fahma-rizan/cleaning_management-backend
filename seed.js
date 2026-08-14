@@ -20,8 +20,7 @@ const seedUsers = [
     password: 'admin123',
     phone: '0112345678',
     role: 'admin',
-    adminRole: 'Admin',
-    verified: true,
+    isVerified: true,
     requiresPasswordChange: false,
     isAvailable: false,
   },
@@ -33,7 +32,7 @@ const seedUsers = [
     phone: '0112345679',
     role: 'admin',
     adminRole: 'Operations Manager',
-    verified: true,
+    isVerified: true,
     requiresPasswordChange: false,
     isAvailable: false,
   },
@@ -45,7 +44,7 @@ const seedUsers = [
     phone: '0112345680',
     role: 'admin',
     adminRole: 'Customer Support',
-    verified: true,
+    isVerified: true,
     requiresPasswordChange: false,
     isAvailable: false,
   },
@@ -56,7 +55,7 @@ const seedUsers = [
     password: 'staff123',          // temporary password — must change on first login
     phone: '0112345681',
     role: 'staff',
-    verified: true,
+    isVerified: true,
     requiresPasswordChange: true,  // triggers the first-login password change flow
     isAvailable: true,
   },
@@ -81,7 +80,7 @@ const seed = async () => {
             password:              hashedPassword,
             requiresPasswordChange: userData.requiresPasswordChange,
             isAvailable:           userData.isAvailable ?? true,
-            verified:              true,
+            isVerified:            true,
           },
         }
       );
