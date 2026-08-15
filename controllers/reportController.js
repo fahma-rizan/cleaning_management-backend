@@ -1,5 +1,7 @@
 const Booking = require('../models/Booking');
 const User    = require('../models/User');
+const InventoryItem = require('../models/InventoryItem');
+const InventoryTransaction = require('../models/InventoryTransaction');
 
 const PAYMENT_METHOD_LABELS = {
   cash: 'Cash on Delivery',
@@ -141,6 +143,96 @@ const getCustomersReport = async (req, res) => {
   }
 };
 
+// ─── GET /api/reports/monthly?year&month ───────────────────────────────────────
+// Per-item stock movement summary (Inventory > Monthly Report tab).
+const getMonthlyInventoryReport = async (req, res) => {
+  try {
+    const year  = Number(req.query.year)  || new Date().getFullYear();
+    const month = Number(req.query.month) || (new Date().getMonth() + 1); // 1-12
+
+    const start = new Date(year, month - 1, 1);
+    const end   = new Date(year, month, 1);
+
+    const transactions = await InventoryTransaction.find({ createdAt: { $gte: start, $lt: end } });
+    const items = await InventoryItem.find();
+    const itemMap = Object.fromEntries(items.map(i => [String(i._id), i]));
+
+    const byItem = {};
+    for (const t of transactions) {
+      const key = String(t.itemId);
+      if (!byItem[key]) byItem[key] = { deducted: 0, returned: 0, restocked: 0, transactionCount: 0 };
+      byItem[key].transactionCount += 1;
+      if (t.type === 'deduct')          byItem[key].deducted  += t.quantity;
+      else if (t.type === 'return')     byItem[key].returned  += t.quantity;
+      else if (t.type === 'restock')    byItem[key].restocked += t.quantity;
+    }
+
+    const perItem = Object.entries(byItem).map(([itemId, stats]) => {
+      const item = itemMap[itemId] || {};
+      return {
+        name: item.name, sku: item.sku, type: item.type,
+        deducted: stats.deducted, returned: stats.returned,
+        netConsumed: Math.max(0, stats.deducted - stats.returned),
+        restocked: stats.restocked, transactionCount: stats.transactionCount,
+      };
+    });
+
+    const summary = perItem.reduce(
+      (acc, r) => ({
+        totalDeducted: acc.totalDeducted + r.deducted,
+        totalReturned: acc.totalReturned + r.returned,
+        netConsumed:   acc.netConsumed   + r.netConsumed,
+        totalRestocked: acc.totalRestocked + r.restocked,
+      }),
+      { totalDeducted: 0, totalReturned: 0, netConsumed: 0, totalRestocked: 0 }
+    );
+
+    res.json({ year, month, summary, items: perItem });
+  } catch (err) {
+    console.error('getMonthlyInventoryReport error:', err);
+    res.status(500).json({ error: 'Failed to generate monthly inventory report' });
+  }
+};
+
+// ─── GET /api/reports/anomalies?year&month ─────────────────────────────────────
+// Simple anomaly summary: items deducted far more than average (>2x median usage).
+const getAnomalySummary = async (req, res) => {
+  try {
+    const year  = Number(req.query.year)  || new Date().getFullYear();
+    const month = Number(req.query.month) || (new Date().getMonth() + 1);
+    const start = new Date(year, month - 1, 1);
+    const end   = new Date(year, month, 1);
+
+    const deducts = await InventoryTransaction.find({ type: 'deduct', createdAt: { $gte: start, $lt: end } });
+    const perItem = {};
+    deducts.forEach(t => {
+      const key = String(t.itemId);
+      perItem[key] = (perItem[key] || 0) + t.quantity;
+    });
+
+    const values = Object.values(perItem).sort((a, b) => a - b);
+    const median = values.length ? values[Math.floor(values.length / 2)] : 0;
+    const threshold = median * 2 || 0;
+
+    const items = await InventoryItem.find();
+    const itemMap = Object.fromEntries(items.map(i => [String(i._id), i]));
+
+    const anomalies = Object.entries(perItem)
+      .filter(([, total]) => threshold > 0 && total > threshold)
+      .map(([itemId, total]) => ({
+        item: { name: itemMap[itemId]?.name, sku: itemMap[itemId]?.sku },
+        totalDeducted: total,
+        medianUsage: median,
+      }));
+
+    res.json({ year, month, anomalies });
+  } catch (err) {
+    console.error('getAnomalySummary error:', err);
+    res.status(500).json({ error: 'Failed to generate anomaly summary' });
+  }
+};
+
 module.exports = {
   getBookingsReport, getPaymentsReport, getStaffPerformanceReport, getCustomersReport,
+  getMonthlyInventoryReport, getAnomalySummary,
 };

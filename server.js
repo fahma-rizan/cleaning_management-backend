@@ -50,6 +50,11 @@ app.use('/api/pricelists', require('./routes/pricelistRoutes'));
 app.use('/api/payments',   require('./routes/paymentRoutes'));
 app.use('/api/settings',   require('./routes/settingsRoutes'));
 app.use('/api/gps',        require('./routes/gpsRoutes'));
+app.use('/api/inventory',         require('./routes/inventoryRoutes'));
+app.use('/api/material-requests', require('./routes/materialRequestRoutes'));
+app.use('/api/completion-reports',require('./routes/completionReportRoutes'));
+app.use('/api/alerts',            require('./routes/alertRoutes'));
+app.use('/api/loyalty',           require('./routes/loyaltyRoutes'));
 
 // Health check - open this in browser to confirm server is working
 app.get('/api/health', (req, res) => {

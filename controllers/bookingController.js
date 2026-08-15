@@ -2,6 +2,7 @@ const Booking   = require('../models/Booking');
 const User      = require('../models/User');
 const sendEmail = require('../utils/sendEmail');
 const { getTodayLocalStr } = require('../utils/dateUtils');
+const { awardPointsForBooking } = require('./loyaltyController');
 
 const TIME_SLOTS = [
   '9:00AM - 11:00AM',
@@ -411,7 +412,16 @@ const markCashReceived = async (req, res) => {
     if (!booking) return res.status(404).json({ success: false, message: 'Task not found.' });
 
     booking.paymentStatus = 'paid';
+    if (!booking.paidAmount) booking.paidAmount = booking.price || 0;
     await booking.save();
+
+    // Award loyalty points for the payment — non-fatal if it fails.
+    try {
+      await awardPointsForBooking(booking.customerId, booking.paidAmount, booking._id, booking.bookingId);
+    } catch (loyaltyErr) {
+      console.error('awardPointsForBooking (cash-received) error:', loyaltyErr);
+    }
+
     res.json({ success: true, booking });
   } catch (err) {
     console.error('markCashReceived error:', err);

@@ -12,6 +12,11 @@ const connectDB = require('./config/db');
 const User = require('./models/User');
 const Settings = require('./models/Settings');
 const Offer = require('./models/Offer');
+const InventoryItem = require('./models/InventoryItem');
+const InventoryTransaction = require('./models/InventoryTransaction');
+const MaterialRequest = require('./models/MaterialRequest');
+const LoyaltyTransaction = require('./models/LoyaltyTransaction');
+const Booking = require('./models/Booking');
 const bcrypt = require('bcryptjs');
 
 // Customer-facing price lists — serviceId matches Services.tsx (9=Dry Cleaning,
@@ -171,6 +176,30 @@ const seedUsers = [
   },
 ];
 
+// ── Inventory items ──────────────────────────────────────────────────────────
+const seedInventoryItems = [
+  { sku: 'IRN-001',  name: 'Steam Iron',                  type: 'equipment',  quantity: 6,  unit: 'units',  lowStockThreshold: 5 },
+  { sku: 'CONS-001', name: 'All-purpose cleaner',         type: 'consumable', quantity: 47, unit: 'litres', lowStockThreshold: 10 },
+  { sku: 'CONS-002', name: 'Floor cleaner',                type: 'consumable', quantity: 50, unit: 'litres', lowStockThreshold: 10 },
+  { sku: 'CONS-003', name: 'Bathroom / toilet cleaner',   type: 'consumable', quantity: 50, unit: 'litres', lowStockThreshold: 10 },
+  { sku: 'CONS-004', name: 'Kitchen degreaser',           type: 'consumable', quantity: 50, unit: 'litres', lowStockThreshold: 10 },
+  { sku: 'CONS-005', name: 'Glass cleaner',               type: 'consumable', quantity: 48, unit: 'litres', lowStockThreshold: 10 },
+  { sku: 'CONS-006', name: 'Cabinet and drawer cleaner',  type: 'consumable', quantity: 50, unit: 'litres', lowStockThreshold: 10 },
+  { sku: 'CONS-019', name: 'High-speed polishing compound', type: 'consumable', quantity: 40, unit: 'litres', lowStockThreshold: 10 },
+  { sku: 'CONS-020', name: 'Crystallization chemical',   type: 'consumable', quantity: 35, unit: 'litres', lowStockThreshold: 10 },
+  { sku: 'CONS-029', name: 'Upholstery sanitizer spray',  type: 'consumable', quantity: 49, unit: 'units',  lowStockThreshold: 10 },
+  { sku: 'CONS-030', name: 'Allergen treatment solution', type: 'consumable', quantity: 49, unit: 'units',  lowStockThreshold: 10 },
+  { sku: 'CONS-040', name: 'Microfiber cloths',           type: 'consumable', quantity: 18, unit: 'pieces', lowStockThreshold: 15 },
+  { sku: 'CONS-045', name: 'Gloves (disposable)',         type: 'consumable', quantity: 28, unit: 'pieces', lowStockThreshold: 20 },
+  { sku: 'CONS-049', name: 'Buffing pads',                type: 'consumable', quantity: 25, unit: 'pieces', lowStockThreshold: 8 },
+  { sku: 'CONS-050', name: 'Diamond cutting pads',        type: 'consumable', quantity: 22, unit: 'pieces', lowStockThreshold: 8 },
+  { sku: 'EQ-005',   name: 'Vacuum Cleaner',               type: 'equipment',  quantity: 4,  unit: 'units',  lowStockThreshold: 3 },
+  { sku: 'EQ-008',   name: 'Pressure Washer',              type: 'equipment',  quantity: 2,  unit: 'units',  lowStockThreshold: 2 },
+  { sku: 'EQ-012',   name: 'Steam cleaner machine',        type: 'equipment',  quantity: 0,  unit: 'units',  lowStockThreshold: 1 },
+  { sku: 'EQ-015',   name: 'Floor Polisher',               type: 'equipment',  quantity: 3,  unit: 'units',  lowStockThreshold: 2 },
+  { sku: 'CONS-060', name: 'Fabric freshener spray',       type: 'consumable', quantity: 8,  unit: 'litres', lowStockThreshold: 10 },
+];
+
 const seed = async () => {
   await connectDB();
   console.log('\n🌱 Seeding database...\n');
@@ -224,6 +253,126 @@ const seed = async () => {
       await Offer.create(offerData);
       console.log(`✅ Created: offer ${offerData.code}`);
     }
+  }
+
+  // ── Inventory items ──────────────────────────────────────────────────────────
+  const itemIdBySku = {};
+  for (const itemData of seedInventoryItems) {
+    let doc = await InventoryItem.findOne({ sku: itemData.sku });
+    if (doc) {
+      await InventoryItem.updateOne({ sku: itemData.sku }, { $set: itemData });
+      doc = await InventoryItem.findOne({ sku: itemData.sku });
+    } else {
+      doc = await InventoryItem.create(itemData);
+    }
+    itemIdBySku[itemData.sku] = doc._id;
+  }
+  console.log(`✅ Seeded ${seedInventoryItems.length} inventory items`);
+
+  // A couple of restock transactions so the Monthly Report tab has real numbers.
+  const restockSku = 'CONS-049'; // Buffing pads
+  const restockItem = await InventoryItem.findOne({ sku: restockSku });
+  if (restockItem) {
+    const already = await InventoryTransaction.findOne({ itemId: restockItem._id, reference: 'SEED-DEMO' });
+    if (!already) {
+      const previousQty = restockItem.quantity;
+      await InventoryTransaction.create({
+        itemId: restockItem._id, type: 'deduct', quantity: 10,
+        previousQty, newQty: previousQty, reference: 'SEED-DEMO', notes: 'Demo usage on a completed booking',
+      });
+      await InventoryTransaction.create({
+        itemId: itemIdBySku['CONS-020'], type: 'deduct', quantity: 2,
+        previousQty: 35, newQty: 35, reference: 'SEED-DEMO', notes: 'Demo usage',
+      });
+      await InventoryTransaction.create({
+        itemId: itemIdBySku['CONS-050'], type: 'deduct', quantity: 10,
+        previousQty: 22, newQty: 22, reference: 'SEED-DEMO', notes: 'Demo usage',
+      });
+      await InventoryTransaction.create({
+        itemId: itemIdBySku['CONS-045'], type: 'deduct', quantity: 10,
+        previousQty: 28, newQty: 28, reference: 'SEED-DEMO', notes: 'Demo usage',
+      });
+      await InventoryTransaction.create({
+        itemId: itemIdBySku['CONS-019'], type: 'deduct', quantity: 3,
+        previousQty: 40, newQty: 40, reference: 'SEED-DEMO', notes: 'Demo usage',
+      });
+      console.log('✅ Seeded demo inventory transactions for Monthly Report');
+    }
+  }
+
+  // ── Material requests, tied to real existing bookings ────────────────────────
+  const demoBookings = await Booking.find({ customerName: 'sathushiya saravanapava' }).limit(4);
+  if (demoBookings.length > 0 && (await MaterialRequest.countDocuments()) === 0) {
+    const templates = [
+      {
+        status: 'approved',
+        items: [
+          { itemType: 'consumable', sku: 'CONS-029', name: 'Upholstery sanitizer spray', requestedQty: 1 },
+          { itemType: 'consumable', sku: 'CONS-030', name: 'Allergen treatment solution', requestedQty: 1 },
+          { itemType: 'consumable', sku: 'CONS-040', name: 'Microfiber cloths',            requestedQty: 10 },
+          { itemType: 'consumable', sku: 'CONS-045', name: 'Gloves (disposable)',          requestedQty: 5 },
+          { itemType: 'equipment',  sku: 'EQ-012',   name: 'Steam cleaner machine',        requestedQty: 1 },
+        ],
+      },
+      {
+        status: 'pending',
+        items: [
+          { itemType: 'consumable', sku: 'CONS-019', name: 'High-speed polishing compound', requestedQty: 3 },
+          { itemType: 'consumable', sku: 'CONS-020', name: 'Crystallization chemical',       requestedQty: 2 },
+          { itemType: 'consumable', sku: 'CONS-050', name: 'Diamond cutting pads',            requestedQty: 10 },
+        ],
+      },
+      {
+        status: 'pending',
+        items: [
+          { itemType: 'consumable', sku: 'CONS-001', name: 'All-purpose cleaner', requestedQty: 5 },
+          { itemType: 'consumable', sku: 'CONS-002', name: 'Floor cleaner',       requestedQty: 5 },
+          { itemType: 'consumable', sku: 'CONS-005', name: 'Glass cleaner',       requestedQty: 3 },
+        ],
+      },
+    ];
+
+    for (let i = 0; i < Math.min(templates.length, demoBookings.length); i++) {
+      const booking = demoBookings[i];
+      const template = templates[i];
+      const items = await Promise.all(template.items.map(async (line) => {
+        const item = await InventoryItem.findOne({ sku: line.sku });
+        const inStock = item ? item.quantity : 0;
+        return {
+          itemType: line.itemType, itemId: item?._id, name: line.name, sku: line.sku,
+          requestedQty: line.requestedQty, inStock, sufficient: inStock >= line.requestedQty,
+        };
+      }));
+      await MaterialRequest.create({ bookingId: booking._id, items, status: template.status });
+    }
+    console.log(`✅ Seeded ${Math.min(templates.length, demoBookings.length)} material requests`);
+  }
+
+  // ── Loyalty demo data for an existing real customer ──────────────────────────
+  const loyaltyDemoUser = await User.findOne({ email: 'sathu@gmail.com' });
+  if (loyaltyDemoUser && (await LoyaltyTransaction.countDocuments({ userId: loyaltyDemoUser._id })) === 0) {
+    loyaltyDemoUser.lifetimePoints = 1612;
+    loyaltyDemoUser.loyaltyPoints = 862;
+    loyaltyDemoUser.badge = 'Platinum';
+    loyaltyDemoUser.tierDiscountsUsed = { Silver: true, Gold: true, Platinum: true };
+    await loyaltyDemoUser.save();
+
+    const daysAgo = (n) => new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+    const txns = [
+      { type: 'earned',   points: 150,  reason: 'Earned for booking payment (full)', createdAt: daysAgo(52) },
+      { type: 'redeemed', points: -200, reason: 'Redeemed 200 pts for Rs. 200 discount', createdAt: daysAgo(52) },
+      { type: 'bonus',    points: 0,    reason: 'Tier upgraded from gold to platinum — lifetime points reached 700', createdAt: daysAgo(45) },
+      { type: 'earned',   points: 150,  reason: 'Earned for booking payment (full)', createdAt: daysAgo(45) },
+      { type: 'earned',   points: 150,  reason: 'Earned for booking payment (full)', createdAt: daysAgo(38) },
+      { type: 'redeemed', points: -150, reason: 'Redeemed 150 pts for Rs. 150 discount', createdAt: daysAgo(38) },
+      { type: 'earned',   points: 150,  reason: 'Earned for booking payment (full)', createdAt: daysAgo(30) },
+      { type: 'earned',   points: 150,  reason: 'Earned for booking payment (full)', createdAt: daysAgo(22) },
+      { type: 'earned',   points: 150,  reason: 'Earned for booking payment (full)', createdAt: daysAgo(11) },
+    ];
+    for (const t of txns) {
+      await LoyaltyTransaction.create({ userId: loyaltyDemoUser._id, ...t });
+    }
+    console.log(`✅ Seeded loyalty demo data for ${loyaltyDemoUser.email} (Platinum, 1,612 lifetime pts)`);
   }
 
   console.log('\n✅ Seeding complete!');

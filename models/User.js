@@ -37,10 +37,19 @@ const userSchema = new mongoose.Schema(
     requiresPasswordChange: { type: Boolean, default: false },
 
     // — Loyalty (customers) ———————————————————————————————————————————————————
-    loyaltyPoints: { type: Number, default: 0 },
+    loyaltyPoints:  { type: Number, default: 0 }, // redeemable balance — resets Dec 31 each year
+    lifetimePoints: { type: Number, default: 0 }, // never resets — determines tier permanently
     badge: {
       type: String,
-      enum: ['Silver', 'Gold', 'Platinum'],
+      enum: ['Bronze', 'Silver', 'Gold', 'Platinum'],
+    },
+    // One-time discount reward per tier, e.g. { Silver: true, Gold: false, ... } once used
+    tierDiscountsUsed: { type: mongoose.Schema.Types.Mixed, default: {} },
+    // A reserved-but-not-yet-applied tier discount, consumed by the next booking
+    pendingTierDiscount: {
+      tier:     { type: String },
+      percent:  { type: Number },
+      reservedAt: { type: Date },
     },
 
     // — Staff-specific ————————————————————————————————————————————————————————
@@ -100,11 +109,13 @@ userSchema.methods.comparePassword = async function (plain) {
 };
 
 // — Auto-assign badge based on loyalty points ——————————————————————————————————
+// Tier thresholds are based on LIFETIME points (never reset) — keep in sync with
+// the frontend's src/app/lib/loyaltyTiers.ts TIERS definition.
 userSchema.methods.updateBadge = function () {
-  if      (this.loyaltyPoints >= 1000) this.badge = 'Platinum';
-  else if (this.loyaltyPoints >= 500)  this.badge = 'Gold';
-  else if (this.loyaltyPoints >= 100)  this.badge = 'Silver';
-  else                                  this.badge = undefined;
+  if      (this.lifetimePoints >= 700) this.badge = 'Platinum';
+  else if (this.lifetimePoints >= 300) this.badge = 'Gold';
+  else if (this.lifetimePoints >= 100) this.badge = 'Silver';
+  else                                   this.badge = 'Bronze';
 };
 
 module.exports = mongoose.model('User', userSchema);
