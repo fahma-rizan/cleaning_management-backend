@@ -15,8 +15,15 @@ const server = http.createServer(app);
 connectDB();
 
 // Middleware
+// Allow any localhost dev-server port — Vite lands on 5174/5175/etc. whenever
+// 5173 is already taken by another running instance, and CORS was silently
+// blocking all API calls whenever that happened. Only localhost origins match.
+const isLocalhostOrigin = (origin) => !origin || /^http:\/\/localhost:\d+$/.test(origin);
 app.use(cors({
-  origin: 'http://localhost:5173',
+  origin: (origin, callback) => {
+    if (isLocalhostOrigin(origin)) return callback(null, true);
+    callback(new Error('Not allowed by CORS'));
+  },
   credentials: true
 }));
 app.use(express.json());
@@ -27,7 +34,13 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ─── Socket.IO — live GPS updates for the admin dashboard ─────────────────────
 const io = new Server(server, {
-  cors: { origin: 'http://localhost:5173', credentials: true },
+  cors: {
+    origin: (origin, callback) => {
+      if (isLocalhostOrigin(origin)) return callback(null, true);
+      callback(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+  },
 });
 app.set('io', io); // controllers reach it via req.app.get('io')
 io.on('connection', (socket) => {
