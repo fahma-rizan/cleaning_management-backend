@@ -45,6 +45,8 @@ app.use('/api/overview',   require('./routes/overviewRoutes'));
 app.use('/api/reviews',    require('./routes/reviewRoutes'));
 app.use('/api/complaints', require('./routes/complaintRoutes'));
 app.use('/api/reports',    require('./routes/reportRoutes'));
+app.use('/api/offers',     require('./routes/offerRoutes'));
+app.use('/api/pricelists', require('./routes/pricelistRoutes'));
 app.use('/api/settings',   require('./routes/settingsRoutes'));
 app.use('/api/gps',        require('./routes/gpsRoutes'));
 
