@@ -27,12 +27,13 @@ const userSchema = new mongoose.Schema(
     // Sub-role for admins only
     adminRole: {
       type: String,
-      enum: ['Operations Manager', 'Customer Support'],
+      enum: ['Super Admin', 'Main Admin', 'Operations Manager', 'Customer Support'],
     },
 
     // — Account status ————————————————————————————————————————————————————————
     isVerified:             { type: Boolean, default: false },
     isActive:               { type: Boolean, default: true },
+    status:                 { type: String, enum: ['active', 'inactive', 'blocked'], default: 'active' },
     requiresPasswordChange: { type: Boolean, default: false },
 
     // — Loyalty (customers) ———————————————————————————————————————————————————
@@ -52,6 +53,16 @@ const userSchema = new mongoose.Schema(
     }],
     rating:        { type: Number, default: 0 },
     jobsCompleted: { type: Number, default: 0 },
+
+    // — Live GPS tracking (staff) ————————————————————————————————————————————————
+    gpsStatus:         { type: String, enum: ['On the Way', 'On Site', 'Completed', 'Offline'], default: 'Offline' },
+    currentLat:        { type: Number },
+    currentLng:        { type: Number },
+    gpsEta:            { type: String },
+    gpsCustomerName:   { type: String },
+    gpsCustomerAddress:{ type: String },
+    gpsCurrentJob:     { type: String },
+    gpsUpdatedAt:      { type: Date },
 
     // — OAuth ——————————————————————————————————————————————————————————————————
     googleId: { type: String, select: false },
