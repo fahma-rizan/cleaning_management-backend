@@ -129,6 +129,7 @@ const seedUsers = [
     password: 'admin123',
     phone: '0112345678',
     role: 'admin',
+    adminRole: 'Super Admin',
     isVerified: true,
     requiresPasswordChange: false,
     isAvailable: false,
@@ -187,6 +188,8 @@ const seed = async () => {
         {
           $set: {
             password:              hashedPassword,
+            role:                   userData.role,
+            adminRole:              userData.adminRole,
             requiresPasswordChange: userData.requiresPasswordChange,
             isAvailable:           userData.isAvailable ?? true,
             isVerified:            true,
