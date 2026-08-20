@@ -1,14 +1,18 @@
-const Booking   = require('../models/Booking');
-const User      = require('../models/User');
+const Booking             = require('../models/Booking');
+const User                = require('../models/User');
+const TaskDeclineRequest  = require('../models/TaskDeclineRequest');
 const sendEmail = require('../utils/sendEmail');
 const { getTodayLocalStr } = require('../utils/dateUtils');
 const { awardPointsForBooking } = require('./loyaltyController');
 
+// Keep in sync with TIME_SLOTS in validators/bookingValidators.js.
+// 30-minute gap between every slot.
 const TIME_SLOTS = [
-  '9:00AM - 11:00AM',
-  '11:00AM - 1:00PM',
-  '2:00PM - 4:00PM',
-  '4:00PM - 6:00PM',
+  '8:00AM - 10:00AM',
+  '10:30AM - 12:30PM',
+  '1:00PM - 3:00PM',
+  '3:30PM - 5:30PM',
+  '6:00PM - 8:00PM',
 ];
 
 const ACTIVE_STATUSES = ['pending', 'confirmed', 'in-progress'];
@@ -84,6 +88,36 @@ const getBusyStaffIds = async (date, time, excludeBookingId = null) => {
     (b.assignedTeam || []).forEach(m => busy.add(m.staffId.toString()));
   });
   return busy;
+};
+
+// Whether a given date+time slot has enough qualified, unbooked staff to
+// actually staff `serviceInfo` (an object with serviceName/serviceType/
+// serviceCategory — a Booking document or a plain object both work).
+// This is the single source of truth for slot availability everywhere —
+// replaces the old fixed "max 3 bookings per slot" rule entirely, which
+// blurred/blocked a slot purely on booking count regardless of whether
+// staff were actually free.
+const getSlotStaffAvailability = async (date, time, serviceInfo = {}, excludeBookingId = null) => {
+  const isTeam = requiresTeam(serviceInfo);
+  const spec   = getRequiredSpecialization(serviceInfo);
+
+  // Same rule autoAssignBooking uses: today only counts staff currently
+  // marked available; a future date can use any active staff since their
+  // availability toggle only reflects "right now".
+  const todayStr = getTodayLocalStr();
+  const availFilter = date === todayStr ? { isAvailable: true } : {};
+
+  const busyIds = await getBusyStaffIds(date, time, excludeBookingId);
+
+  const candidateCount = await User.countDocuments({
+    role:            'staff',
+    specializations: spec,
+    _id:             { $nin: [...busyIds] },
+    ...availFilter,
+  });
+
+  const requiredCount = isTeam ? 3 : 1; // team services (Home/Office, Sofa/Mattress) need a full team of 3
+  return { available: candidateCount >= requiredCount, spec, isTeam, candidateCount, requiredCount };
 };
 
 // Internal: assign a booking to staff (team of 3 or single depending on service)
@@ -164,15 +198,13 @@ const createBooking = async (req, res) => {
     const data = req.body;
 
     if (data.date && data.time) {
-      const count = await Booking.countDocuments({
-        date:   data.date,
-        time:   data.time,
-        status: { $nin: ['cancelled'] },
-      });
-      if (count >= 3) {
+      // Staff-availability check, not a fixed booking-count limit — a slot
+      // is only rejected here if no qualified staff are actually free for it.
+      const { available } = await getSlotStaffAvailability(data.date, data.time, data);
+      if (!available) {
         return res.status(400).json({
           success: false,
-          message: 'This time slot became fully booked. Please choose another time.',
+          message: 'No staff are available for this time slot. Please choose another time.',
         });
       }
     }
@@ -252,21 +284,22 @@ const getAssignedBookings = async (req, res) => {
   }
 };
 
-// ─── GET /api/bookings/slot-check?date=YYYY-MM-DD ────────────────────────────
+// ─── GET /api/bookings/slot-check?date=YYYY-MM-DD&serviceName=&serviceType=&serviceCategory= ──
+// Returns per-slot staff availability (not booking counts) — a slot is
+// available exactly when enough qualified, unbooked staff exist to actually
+// staff the requested service at that date+time.
 const checkSlotAvailability = async (req, res) => {
   try {
-    const { date } = req.query;
+    const { date, serviceName, serviceType, serviceCategory } = req.query;
     if (!date) return res.status(400).json({ success: false, message: 'date is required' });
 
-    const slotCounts = {};
+    const serviceInfo = { serviceName, serviceType, serviceCategory };
+    const slotAvailability = {};
     for (const slot of TIME_SLOTS) {
-      slotCounts[slot] = await Booking.countDocuments({
-        date,
-        time:   slot,
-        status: { $nin: ['cancelled'] },
-      });
+      const { available } = await getSlotStaffAvailability(date, slot, serviceInfo);
+      slotAvailability[slot] = available;
     }
-    res.json({ success: true, slotCounts });
+    res.json({ success: true, slotAvailability });
   } catch (err) {
     console.error('checkSlotAvailability error:', err);
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -283,14 +316,10 @@ const rescheduleBooking = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Cannot reschedule a cancelled or completed booking.' });
     }
 
-    // Check the new slot is not already full (max 3 bookings per slot)
-    const count = await Booking.countDocuments({
-      date, time,
-      status: { $nin: ['cancelled'] },
-      _id:    { $ne: booking._id },
-    });
-    if (count >= 3) {
-      return res.status(400).json({ success: false, message: 'That time slot is fully booked. Please choose a different time.' });
+    // Staff-availability check for the new slot — not a fixed booking-count limit.
+    const { available } = await getSlotStaffAvailability(date, time, booking, booking._id);
+    if (!available) {
+      return res.status(400).json({ success: false, message: 'No staff are available for that time slot. Please choose a different time.' });
     }
     
     //update date and time
@@ -429,7 +458,97 @@ const markCashReceived = async (req, res) => {
   }
 };
 
+// Performs the actual decline: removes the staff member from the booking and
+// tries to find a replacement. This used to run immediately inside
+// declineTask; it now only runs once an admin approves the staff member's
+// decline request (see staffRequestController.approveDeclineRequest).
+const applyTaskDecline = async (booking, staffId, staffName, staffEmail, reason) => {
+  booking.declineHistory.push({ staffId, staffName, staffEmail, reason });
+
+  const hasTeam  = booking.assignedTeam && booking.assignedTeam.length > 0;
+  const todayStr = getTodayLocalStr();
+  // For today's bookings only available staff can replace; future tasks use any staff
+  const availFilter = booking.date === todayStr ? { isAvailable: true } : {};
+
+  if (hasTeam) {
+    // Remove declining member from team
+    booking.assignedTeam = booking.assignedTeam.filter(
+      m => m.staffId.toString() !== staffId.toString()
+    );
+
+    // If the declining member was the team lead, reassign lead to next remaining member
+    if (booking.assignedStaffId && booking.assignedStaffId.toString() === staffId.toString()) {
+      const remaining = booking.assignedTeam;
+      if (remaining.length > 0) {
+        booking.assignedStaffId    = remaining[0].staffId;
+        booking.assignedStaffName  = remaining[0].staffName;
+        booking.assignedStaffEmail = remaining[0].staffEmail;
+      } else {
+        booking.assignedStaffId    = undefined;
+        booking.assignedStaffName  = undefined;
+        booking.assignedStaffEmail = undefined;
+      }
+    }
+
+    // Find replacement — exclude current team and everyone who already declined
+    const excludeIds = [
+      ...booking.assignedTeam.map(m => m.staffId),
+      ...booking.declineHistory.map(d => d.staffId),
+    ];
+
+    const candidates = await User.find({
+      role: 'staff',
+      _id:  { $nin: excludeIds },
+      ...availFilter,
+    });
+
+    //replacementSinglestaffbooking — find a different staff member
+    if (candidates.length > 0) {
+      const chosen = await pickLeastLoaded(candidates, 1);
+      booking.assignedTeam.push({
+        staffId:    chosen[0]._id,
+        staffName:  chosen[0].name,
+        staffEmail: chosen[0].email,
+      });
+      booking.needsAdminAttention     = false;
+      booking.adminNotificationReason = '';
+    } else {
+      booking.needsAdminAttention     = true;
+      booking.adminNotificationReason = `Team member ${staffName} declined. No replacement available.`;
+    }
+  } else {
+    //replacementSinglestaffbooking — find a different staff member
+    const candidates = await User.find({
+      role: 'staff',
+      _id:  { $ne: staffId },
+      ...availFilter,
+    });
+
+    if (candidates.length > 0) {
+      const chosen = await pickLeastLoaded(candidates, 1);
+      booking.assignedStaffId    = chosen[0]._id;
+      booking.assignedStaffName  = chosen[0].name;
+      booking.assignedStaffEmail = chosen[0].email;
+      booking.needsAdminAttention     = false;
+      booking.adminNotificationReason = '';
+    } else {
+      booking.assignedStaffId    = undefined;
+      booking.assignedStaffName  = undefined;
+      booking.assignedStaffEmail = undefined;
+      booking.needsAdminAttention     = true;
+      booking.adminNotificationReason = `Staff ${staffName} declined. No available replacement found.`;
+    }
+  }
+
+  await booking.save();
+  return booking;
+};
+
 // ─── PATCH /api/bookings/:id/decline ─────────────────────────────────────────
+// Submits a decline request for admin approval — does NOT touch the booking.
+// The task stays assigned to this staff member until an admin approves it
+// (see staffRequestController.approveDeclineRequest, which calls
+// applyTaskDecline above) or stays assigned forever if the admin rejects it.
 const declineTask = async (req, res) => {
   try {
     const { reason } = req.body;
@@ -444,90 +563,27 @@ const declineTask = async (req, res) => {
     });
     if (!booking) return res.status(404).json({ success: false, message: 'Task not found.' });
 
-    booking.declineHistory.push({
+    const existing = await TaskDeclineRequest.findOne({
+      bookingId: booking._id, staffId: req.user._id, status: 'pending',
+    });
+    if (existing) {
+      return res.status(400).json({ success: false, message: 'You already have a pending decline request for this task.' });
+    }
+
+    const request = await TaskDeclineRequest.create({
+      bookingId:  booking._id,
+      bookingRef: booking.bookingId,
       staffId:    req.user._id,
       staffName:  req.user.name,
       staffEmail: req.user.email,
       reason,
     });
 
-    const hasTeam  = booking.assignedTeam && booking.assignedTeam.length > 0;
-    const todayStr = getTodayLocalStr();
-    // For today's bookings only available staff can replace; future tasks use any staff
-    const availFilter = booking.date === todayStr ? { isAvailable: true } : {};
-
-    if (hasTeam) {
-      // Remove declining member from team
-      booking.assignedTeam = booking.assignedTeam.filter(
-        m => m.staffId.toString() !== req.user._id.toString()
-      );
-
-      // If the declining member was the team lead, reassign lead to next remaining member
-      if (booking.assignedStaffId && booking.assignedStaffId.toString() === req.user._id.toString()) {
-        const remaining = booking.assignedTeam;
-        if (remaining.length > 0) {
-          booking.assignedStaffId    = remaining[0].staffId;
-          booking.assignedStaffName  = remaining[0].staffName;
-          booking.assignedStaffEmail = remaining[0].staffEmail;
-        } else {
-          booking.assignedStaffId    = undefined;
-          booking.assignedStaffName  = undefined;
-          booking.assignedStaffEmail = undefined;
-        }
-      }
-
-      // Find replacement — exclude current team and everyone who already declined
-      const excludeIds = [
-        ...booking.assignedTeam.map(m => m.staffId),
-        ...booking.declineHistory.map(d => d.staffId),
-      ];
-
-      const candidates = await User.find({
-        role: 'staff',
-        _id:  { $nin: excludeIds },
-        ...availFilter,
-      });
-      
-      //replacementSinglestaffbooking — find a different staff member
-      if (candidates.length > 0) {
-        const chosen = await pickLeastLoaded(candidates, 1);
-        booking.assignedTeam.push({
-          staffId:    chosen[0]._id,
-          staffName:  chosen[0].name,
-          staffEmail: chosen[0].email,
-        });
-        booking.needsAdminAttention     = false;
-        booking.adminNotificationReason = '';
-      } else {
-        booking.needsAdminAttention     = true;
-        booking.adminNotificationReason = `Team member ${req.user.name} declined. No replacement available.`;
-      }
-    } else {
-      //replacementSinglestaffbooking — find a different staff member
-      const candidates = await User.find({
-        role: 'staff',
-        _id:  { $ne: req.user._id },
-        ...availFilter,
-      });
-
-      if (candidates.length > 0) {
-        const chosen = await pickLeastLoaded(candidates, 1);
-        booking.assignedStaffId    = chosen[0]._id;
-        booking.assignedStaffName  = chosen[0].name;
-        booking.assignedStaffEmail = chosen[0].email;
-        booking.needsAdminAttention     = false;
-        booking.adminNotificationReason = '';
-      } else {
-        booking.assignedStaffId    = undefined;
-        booking.assignedStaffName  = undefined;
-        booking.assignedStaffEmail = undefined;
-        booking.needsAdminAttention     = true;
-        booking.adminNotificationReason = `Staff ${req.user.name} declined. No available replacement found.`;
-      }
-    }
-
-    await booking.save();
-    res.json({ success: true, booking });
+    res.json({
+      success: true,
+      message: 'Decline request submitted — waiting for admin approval. The task remains assigned to you until then.',
+      request,
+    });
   } catch (err) {
     console.error('declineTask error:', err);
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -718,6 +774,179 @@ const sendInvoice = async (req, res) => {
   }
 };
 
+// ─── GET /api/bookings/:bookingId ──────────────────────────────────────────────
+// Public lookup by the booking's public bookingId string (e.g. BK-1714...).
+// Used by the PayHere checkout flow to poll whether a payment went through
+// after the sandbox checkout popup closes.
+const getBookingByBookingId = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({ bookingId: req.params.bookingId });
+    if (!booking) return res.status(404).json({ message: 'Booking not found.' });
+    res.json(booking);
+  } catch (err) {
+    console.error('getBookingByBookingId error:', err);
+    res.status(500).json({ message: 'Server error.' });
+  }
+};
+
+// ─── POST /api/bookings/:bookingId/request-reschedule ──────────────────────────
+// Admin-initiated: notifies the customer that a reschedule is being requested
+// (distinct from the customer's own PATCH /:id/reschedule action above).
+const requestReschedule = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({ bookingId: req.params.bookingId });
+    if (!booking) return res.status(404).json({ message: 'Booking not found.' });
+
+    booking.needsAdminAttention     = true;
+    booking.adminNotificationReason = `Reschedule requested: ${req.body?.reason || ''}`;
+    await booking.save();
+
+    if (booking.customerEmail) {
+      await sendEmail({
+        to: booking.customerEmail,
+        subject: 'Reschedule Requested — Cloud Laundry.lk',
+        html: `<p>Dear ${booking.customerName || 'Customer'},</p>
+               <p>We'd like to reschedule your booking <strong>${booking.bookingId}</strong>.</p>
+               <p>Reason: ${req.body?.reason || '—'}</p>
+               <p>Please contact us to pick a new time.</p>`,
+      });
+    }
+
+    res.json({ success: true, booking });
+  } catch (err) {
+    console.error('requestReschedule error:', err);
+    res.status(500).json({ message: 'Failed to send reschedule request.' });
+  }
+};
+
+// ─── POST /api/bookings/:bookingId/request-cancel ──────────────────────────────
+const requestCancel = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({ bookingId: req.params.bookingId });
+    if (!booking) return res.status(404).json({ message: 'Booking not found.' });
+
+    booking.needsAdminAttention     = true;
+    booking.adminNotificationReason = `Cancellation requested: ${req.body?.reason || ''}`;
+    await booking.save();
+
+    if (booking.customerEmail) {
+      await sendEmail({
+        to: booking.customerEmail,
+        subject: 'Cancellation Requested — Cloud Laundry.lk',
+        html: `<p>Dear ${booking.customerName || 'Customer'},</p>
+               <p>We'd like to cancel your booking <strong>${booking.bookingId}</strong>.</p>
+               <p>Reason: ${req.body?.reason || '—'}</p>
+               <p>Please contact us if you have any questions.</p>`,
+      });
+    }
+
+    res.json({ success: true, booking });
+  } catch (err) {
+    console.error('requestCancel error:', err);
+    res.status(500).json({ message: 'Failed to send cancel request.' });
+  }
+};
+
+// ─── GET /api/bookings/cancel/:token ────────────────────────────────────────────
+// Public — the "token" is the booking's public bookingId, reached via the
+// cancel link sent by email. Powers CancelPage.tsx.
+const getCancelInfo = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({ bookingId: req.params.token });
+    if (!booking) return res.status(404).json({ msg: 'Booking not found.' });
+
+    res.json({
+      booking: {
+        bookingId:     booking.bookingId,
+        serviceType:   booking.serviceName,
+        date:          booking.date,
+        time:          booking.time,
+        price:         booking.price,
+        paidAmount:    booking.paidAmount,
+        paymentStatus: booking.paymentStatus,
+        hasPayment:    (booking.paidAmount || 0) > 0,
+      },
+    });
+  } catch (err) {
+    console.error('getCancelInfo error:', err);
+    res.status(500).json({ msg: 'Server error.' });
+  }
+};
+
+// ─── POST /api/bookings/cancel ──────────────────────────────────────────────────
+// Public. Body: { token, reason }
+const confirmCancel = async (req, res) => {
+  try {
+    const { token, reason } = req.body;
+    const booking = await Booking.findOne({ bookingId: token });
+    if (!booking) return res.status(404).json({ msg: 'Booking not found.' });
+    if (booking.status === 'cancelled') return res.status(400).json({ msg: 'Booking is already cancelled.' });
+
+    const scheduled = new Date(`${booking.date} ${booking.time || '00:00'}`);
+    const minutesBeforeService = isNaN(scheduled.getTime())
+      ? undefined
+      : Math.round((scheduled.getTime() - Date.now()) / 60000);
+
+    booking.status              = 'cancelled';
+    booking.cancelledAt         = new Date();
+    booking.cancellationReason  = reason;
+    booking.minutesBeforeService = minutesBeforeService;
+    await booking.save();
+
+    res.json({ success: true, booking });
+  } catch (err) {
+    console.error('confirmCancel error:', err);
+    res.status(500).json({ msg: 'Failed to cancel booking.' });
+  }
+};
+
+// ─── GET /api/bookings/reschedule/:token ────────────────────────────────────────
+// Public. Powers ReschedulePage.tsx.
+const getRescheduleInfo = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({ bookingId: req.params.token });
+    if (!booking) return res.status(404).json({ msg: 'Booking not found.' });
+
+    res.json({
+      booking: {
+        bookingId:    booking.bookingId,
+        serviceType:  booking.serviceName,
+        currentDate:  booking.date,
+        currentTime:  booking.time,
+        originalDate: booking.date,
+        originalTime: booking.time,
+        price:        booking.price,
+        address:      booking.address,
+      },
+    });
+  } catch (err) {
+    console.error('getRescheduleInfo error:', err);
+    res.status(500).json({ msg: 'Server error.' });
+  }
+};
+
+// ─── POST /api/bookings/reschedule ──────────────────────────────────────────────
+// Public. Body: { token, newDate, newTime }
+const confirmReschedule = async (req, res) => {
+  try {
+    const { token, newDate, newTime } = req.body;
+    const booking = await Booking.findOne({ bookingId: token });
+    if (!booking) return res.status(404).json({ msg: 'Booking not found.' });
+    if (['cancelled', 'completed'].includes(booking.status)) {
+      return res.status(400).json({ msg: 'Cannot reschedule a cancelled or completed booking.' });
+    }
+
+    booking.date = newDate;
+    booking.time = newTime;
+    await booking.save();
+
+    res.json({ success: true, booking });
+  } catch (err) {
+    console.error('confirmReschedule error:', err);
+    res.status(500).json({ msg: 'Failed to reschedule booking.' });
+  }
+};
+
 module.exports = {
   createBooking,
   getMyBookings,
@@ -729,9 +958,17 @@ module.exports = {
   completeTask,
   markCashReceived,
   declineTask,
+  applyTaskDecline,
   getAllBookings,
   assignAllUnassigned,
   getNeedsAttention,
   resolveAttention,
   sendInvoice,
+  getBookingByBookingId,
+  requestReschedule,
+  requestCancel,
+  getCancelInfo,
+  confirmCancel,
+  getRescheduleInfo,
+  confirmReschedule,
 };

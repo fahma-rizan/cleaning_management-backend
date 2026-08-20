@@ -1,5 +1,21 @@
 const Settings = require('../models/Settings');
 
+// ─── GET /api/pricelists ────────────────────────────────────────────────────────
+// Public — returns every service's price list. Backed by the same
+// Settings.priceLists store the admin Settings > Pricing tab edits (and that
+// getPriceList below reads one entry from), so this is always in sync with
+// whatever the admin has configured there. Used by AIEstimator.tsx, which
+// expects { success: true, priceLists: [...] }.
+const getAllPriceLists = async (req, res) => {
+  try {
+    const settings = await Settings.getSingleton();
+    res.json({ success: true, priceLists: settings.priceLists || [] });
+  } catch (err) {
+    console.error('getAllPriceLists error:', err);
+    res.status(500).json({ success: false, error: 'Failed to load price lists' });
+  }
+};
+
 // ─── GET /api/pricelists/:serviceId ────────────────────────────────────────────
 // Public — customer-facing price lists (Dry Cleaning=9, Washing&Pressing=10,
 // Pressing=11). Backed by the same Settings.priceLists store the admin
@@ -21,4 +37,4 @@ const getPriceList = async (req, res) => {
   }
 };
 
-module.exports = { getPriceList };
+module.exports = { getAllPriceLists, getPriceList };

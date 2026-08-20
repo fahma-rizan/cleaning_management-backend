@@ -20,6 +20,7 @@ const {
   activateStaffV2,
   deleteStaffV2,
 } = require('../controllers/staffController');
+const { getStaffOverview, getStaffTaskDetails } = require('../controllers/staffRequestController');
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -50,10 +51,12 @@ router.patch('/profile',      protect, updateMyProfile);              // staff
 // lib/api.ts doesn't send a Bearer token yet ("Temporary mock token until auth
 // finishes"). Tighten this once real admin auth is wired through.
 router.get('/available',      getAvailableStaffV2);
+router.get('/overview',       protect, adminOnly, getStaffOverview); // Staff Task Overview — admin
 router.get('/',                getAllStaffV2);
 router.post('/',               upload.single('photo'), createStaffV2);
 
 // ─── /:id wildcard routes — must stay last ─────────────────────────────────────
+router.get('/:id/tasks',       protect, adminOnly, getStaffTaskDetails); // Staff Task Overview — detail drill-down
 router.get('/:id',             getStaffByIdV2);
 router.put('/:id',             upload.single('photo'), updateStaffV2);
 router.put('/:id/deactivate',  deactivateStaffV2);

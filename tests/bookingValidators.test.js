@@ -10,7 +10,7 @@ import {
 describe('createBookingSchema', () => {
   const validData = {
     date: '2026-05-10',
-    time: '9:00AM - 11:00AM',
+    time: '8:00AM - 10:00AM',
     address: '123 Main Street, Colombo',
     price: 1500,
     paymentMethod: 'cod',
@@ -56,12 +56,13 @@ describe('createBookingSchema', () => {
     expect(() => createBookingSchema.parse(data)).toThrow();
   });
 
-  it('accepts all four valid time slots', () => {
+  it('accepts all five valid time slots', () => {
     const slots = [
-      '9:00AM - 11:00AM',
-      '11:00AM - 1:00PM',
-      '2:00PM - 4:00PM',
-      '4:00PM - 6:00PM',
+      '8:00AM - 10:00AM',
+      '10:30AM - 12:30PM',
+      '1:00PM - 3:00PM',
+      '3:30PM - 5:30PM',
+      '6:00PM - 8:00PM',
     ];
     slots.forEach(time => {
       expect(() => createBookingSchema.parse({ ...validData, time })).not.toThrow();
@@ -101,14 +102,14 @@ describe('createBookingSchema', () => {
 
 // ─── rescheduleSchema ─────────────────────────────────────────────────────────
 describe('rescheduleSchema', () => {
-  const validData = { date: '2026-06-15', time: '2:00PM - 4:00PM' };
+  const validData = { date: '2026-06-15', time: '1:00PM - 3:00PM' };
 
   it('accepts valid reschedule data', () => {
     expect(() => rescheduleSchema.parse(validData)).not.toThrow();
   });
 
   it('rejects missing date', () => {
-    expect(() => rescheduleSchema.parse({ time: '2:00PM - 4:00PM' })).toThrow();
+    expect(() => rescheduleSchema.parse({ time: '1:00PM - 3:00PM' })).toThrow();
   });
 
   it('rejects missing time', () => {

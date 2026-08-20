@@ -59,6 +59,7 @@ const userSchema = new mongoose.Schema(
     availabilityLogs: [{
       status:    { type: String },
       changedAt: { type: Date, default: Date.now },
+      reason:    { type: String }, // set when status is 'unavailable' via an approved AvailabilityRequest
     }],
     rating:        { type: Number, default: 0 },
     jobsCompleted: { type: Number, default: 0 },

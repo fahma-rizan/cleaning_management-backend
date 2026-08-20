@@ -25,24 +25,45 @@ const {
   getNeedsAttention,
   resolveAttention,
   sendInvoice,
+  getBookingByBookingId,
+  requestReschedule,
+  requestCancel,
+  getCancelInfo,
+  confirmCancel,
+  getRescheduleInfo,
+  confirmReschedule,
 } = require('../controllers/bookingController');
 
-router.use(protect);
+// ── Public routes (no auth) — email-link cancel/reschedule flows and the
+// PayHere checkout status poll all hit these without a token. Every other
+// route below is explicitly `protect`-ed instead of using a blanket
+// `router.use(protect)`, so that the public '/:bookingId' catch-all can be
+// registered last without accidentally requiring auth. ─────────────────────
+router.get('/cancel/:token',     getCancelInfo);
+router.post('/cancel',           confirmCancel);
+router.get('/reschedule/:token', getRescheduleInfo);
+router.post('/reschedule',       confirmReschedule);
 
-router.get('/slot-check',              validate(slotCheckSchema, 'query'), checkSlotAvailability);
-router.get('/my',                      getMyBookings);
-router.get('/assigned',                getAssignedBookings);
-router.get('/all',                     adminOnly, getAllBookings);
-router.get('/needs-attention',         adminOnly, getNeedsAttention);
-router.post('/',                       validate(createBookingSchema), createBooking);
-router.post('/assign-unassigned',      adminOnly, assignAllUnassigned);
-router.patch('/:id/reschedule',        validate(rescheduleSchema), rescheduleBooking);
-router.patch('/:id/cancel',            validate(cancelSchema), cancelBooking);
-router.patch('/:id/start',             startTask);
-router.patch('/:id/complete',          completeTask);
-router.patch('/:id/cash-received',     markCashReceived);
-router.patch('/:id/decline',           validate(declineSchema), declineTask);
-router.patch('/:id/resolve-attention', adminOnly, resolveAttention);
-router.post('/:id/send-invoice',       sendInvoice);
+router.get('/slot-check',              protect, validate(slotCheckSchema, 'query'), checkSlotAvailability);
+router.get('/my',                      protect, getMyBookings);
+router.get('/assigned',                protect, getAssignedBookings);
+router.get('/all',                     protect, adminOnly, getAllBookings);
+router.get('/needs-attention',         protect, adminOnly, getNeedsAttention);
+router.post('/',                       protect, validate(createBookingSchema), createBooking);
+router.post('/assign-unassigned',      protect, adminOnly, assignAllUnassigned);
+router.post('/:bookingId/request-reschedule', protect, requestReschedule);
+router.post('/:bookingId/request-cancel',     protect, requestCancel);
+router.patch('/:id/reschedule',        protect, validate(rescheduleSchema), rescheduleBooking);
+router.patch('/:id/cancel',            protect, validate(cancelSchema), cancelBooking);
+router.patch('/:id/start',             protect, startTask);
+router.patch('/:id/complete',          protect, completeTask);
+router.patch('/:id/cash-received',     protect, markCashReceived);
+router.patch('/:id/decline',           protect, validate(declineSchema), declineTask);
+router.patch('/:id/resolve-attention', protect, adminOnly, resolveAttention);
+router.post('/:id/send-invoice',       protect, sendInvoice);
+
+// Generic single-segment GET must be last — it would otherwise shadow
+// '/my', '/assigned', '/all', etc. registered above.
+router.get('/:bookingId', getBookingByBookingId);
 
 module.exports = router;

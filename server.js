@@ -27,6 +27,8 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
+// PayHere's IPN webhook posts application/x-www-form-urlencoded, not JSON.
+app.use(express.urlencoded({ extended: true }));
 
 // Serve uploaded staff photos (getPhotoUrl() in the frontend expects
 // http://localhost:5000/uploads/staff/<file> to resolve).
@@ -68,6 +70,17 @@ app.use('/api/material-requests', require('./routes/materialRequestRoutes'));
 app.use('/api/completion-reports',require('./routes/completionReportRoutes'));
 app.use('/api/alerts',            require('./routes/alertRoutes'));
 app.use('/api/loyalty',           require('./routes/loyaltyRoutes'));
+
+// ─── payment-invoice-notifications feature set ─────────────────────────────────
+app.use('/api/invoices',         require('./routes/invoiceRoutes'));
+app.use('/api/refunds',          require('./routes/refundRoutes'));
+app.use('/api/price-reductions', require('./routes/priceReductionRoutes'));
+app.use('/api/email',            require('./routes/emailRoutes'));
+app.use('/api/payhere',          require('./routes/payhereRoutes'));
+app.use('/api/analytics',        require('./routes/analyticsRoutes'));
+app.use('/api/notifications',    require('./routes/notificationRoutes'));
+app.use('/api/audit',            require('./routes/auditRoutes'));
+app.use('/api/staff-requests',   require('./routes/staffRequestRoutes'));
 
 // Health check - open this in browser to confirm server is working
 app.get('/api/health', (req, res) => {

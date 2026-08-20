@@ -1,10 +1,13 @@
 const { z } = require('zod');
 
+// Keep in sync with TIME_SLOTS in controllers/bookingController.js.
+// 30-minute gap between every slot.
 const TIME_SLOTS = [
-  '9:00AM - 11:00AM',
-  '11:00AM - 1:00PM',
-  '2:00PM - 4:00PM',
-  '4:00PM - 6:00PM',
+  '8:00AM - 10:00AM',
+  '10:30AM - 12:30PM',
+  '1:00PM - 3:00PM',
+  '3:30PM - 5:30PM',
+  '6:00PM - 8:00PM',
 ];
 
 const dateField = z
@@ -46,9 +49,15 @@ const cancelSchema = z.object({
   reason: z.string().min(3, 'reason must be at least 3 characters'),
 });
 
-// GET /api/bookings/slot-check?date=
+// GET /api/bookings/slot-check?date=&serviceName=&serviceType=&serviceCategory=
+// The service fields are optional (defaults to a team-required Home/Office
+// Cleaning check when omitted) — pass them so availability reflects the
+// specific service's staff specialization + team-size requirement.
 const slotCheckSchema = z.object({
-  date: dateField,
+  date:            dateField,
+  serviceName:     z.string().optional(),
+  serviceType:     z.string().optional(),
+  serviceCategory: z.string().optional(),
 });
 
 module.exports = {
