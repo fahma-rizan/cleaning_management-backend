@@ -25,9 +25,17 @@ const DEV_ORIGINS = [
   'http://localhost:5174',
 ];
 
-const allowedOrigins = process.env.CLIENT_URL
+// In development, always keep the common dev-port fallbacks available in
+// addition to CLIENT_URL — CRA/Vite silently pick the next free port when
+// their default is taken, which previously required manually updating
+// CLIENT_URL every time (e.g. localhost:3002 got 403'd by CORS while
+// CLIENT_URL only listed 3000/3001).
+const configuredOrigins = process.env.CLIENT_URL
   ? process.env.CLIENT_URL.split(',').map((o) => o.trim())
-  : DEV_ORIGINS;
+  : [];
+const allowedOrigins = process.env.NODE_ENV === 'development'
+  ? [...new Set([...configuredOrigins, ...DEV_ORIGINS])]
+  : (configuredOrigins.length ? configuredOrigins : DEV_ORIGINS);
 
 app.use(cors({
   origin: (origin, callback) => {

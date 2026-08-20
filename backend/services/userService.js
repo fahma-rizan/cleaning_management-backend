@@ -1,3 +1,4 @@
+const crypto       = require('crypto');
 const User         = require('../models/User');
 const AUTH         = require('../constants/auth');
 const emailService = require('./emailService');
@@ -7,13 +8,41 @@ const validatePasswordStrength = (password) => {
 };
 
 /**
+ * generateStrongPassword — produces a random password guaranteed to satisfy
+ * AUTH.PASSWORD_REGEX (lower + upper + digit + special char, 12+ chars).
+ * One character is forced from each required class, the rest are drawn from
+ * the combined pool, then the whole string is shuffled so the required
+ * characters aren't predictably in the same positions every time.
+ */
+const generateStrongPassword = (length = 12) => {
+  const LOWER = 'abcdefghijkmnpqrstuvwxyz';       // no 'l'/'o' — avoid look-alikes
+  const UPPER = 'ABCDEFGHJKLMNPQRSTUVWXYZ';        // no 'I'/'O'
+  const DIGIT = '23456789';                        // no '0'/'1'
+  const SPECIAL = '@$!%*?&#^-_+=';
+  const ALL = LOWER + UPPER + DIGIT + SPECIAL;
+
+  const pick = (chars) => chars[crypto.randomInt(chars.length)];
+  const required = [pick(LOWER), pick(UPPER), pick(DIGIT), pick(SPECIAL)];
+  const rest = Array.from({ length: Math.max(0, length - required.length) }, () => pick(ALL));
+
+  const combined = [...required, ...rest];
+  // Fisher-Yates shuffle
+  for (let i = combined.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [combined[i], combined[j]] = [combined[j], combined[i]];
+  }
+  return combined.join('');
+};
+
+/**
  * Creates a staff member or any admin below super_admin.
- * Sends temporary credentials to the new user's email.
+ * Generates a strong temporary password server-side (the caller never
+ * chooses it) and emails it to the new user.
  *
  * @param {string} role - Must be one of the allowed managed roles.
  * @param {string[]} allowedRoles - Roles the calling admin is permitted to create.
  */
-const createManagedUser = async ({ name, email, phone, role, tempPassword }, allowedRoles) => {
+const createManagedUser = async ({ name, email, phone, role }, allowedRoles) => {
   if (!allowedRoles.includes(role)) {
     throw new Error(`You do not have permission to create a user with role: ${role}`);
   }
@@ -21,7 +50,8 @@ const createManagedUser = async ({ name, email, phone, role, tempPassword }, all
   const existing = await User.findOne({ email });
   if (existing) throw new Error('An account with this email already exists');
 
-  validatePasswordStrength(tempPassword);
+  const tempPassword = generateStrongPassword();
+  validatePasswordStrength(tempPassword); // sanity check the generator's own output
 
   const user = await User.create({
     name,
@@ -36,17 +66,17 @@ const createManagedUser = async ({ name, email, phone, role, tempPassword }, all
 
   await emailService.sendTempCredentials(email, { name, tempPassword, role });
 
-  return { id: user._id, name: user.name, email: user.email, role: user.role };
+  return { id: user._id, name: user.name, email: user.email, role: user.role, tempPassword };
 };
 
 // Kept for backward compat — existing POST /api/users/staff route calls this
-const createStaffUser = async ({ name, email, phone, role, tempPassword }) => {
+const createStaffUser = async ({ name, email, phone, role }) => {
   const STAFF_CREATABLE = [
     AUTH.ROLES.STAFF,
     AUTH.ROLES.OPERATION_ADMIN,
     AUTH.ROLES.CUSTOMER_SUPPORT_ADMIN,
   ];
-  return createManagedUser({ name, email, phone, role, tempPassword }, STAFF_CREATABLE);
+  return createManagedUser({ name, email, phone, role }, STAFF_CREATABLE);
 };
 
 /** List all staff / sub-admins (admin only) */

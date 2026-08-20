@@ -7,7 +7,7 @@ const tokenService = require('./tokenService');
 const emailService = require('./emailService');
 const AUTH         = require('../constants/auth');
 
-const validateEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+const validateEmail = (email) => AUTH.EMAIL_REGEX.test(email);
 
 const generateOtp = () => crypto.randomInt(100000, 999999).toString();
 
@@ -41,15 +41,78 @@ const verifyOtp = async (email, otp, purpose) => {
   await OtpToken.deleteOne({ _id: record._id });
 };
 
-const registerUser = async ({ name, email, password, phone, role }) => {
-  const existing = await User.findOne({ email });
-  if (!validateEmail(email)) throw new Error('Invalid email format');
-  if (existing) throw new Error('An account with this email already exists');
+/**
+ * registerUser — customer sign-up. Always creates a `customer` role account;
+ * the client cannot override the role for this endpoint.
+ *
+ * Validates every field server-side rather than trusting the frontend, then
+ * checks email/phone uniqueness before creating the account.
+ */
+const registerUser = async ({ firstName, lastName, email, password, phone }) => {
+  if (!firstName || !firstName.trim()) throw new Error('First name is required');
+  if (!lastName || !lastName.trim()) throw new Error('Last name is required');
 
-  await User.create({ name, email, password, phone, role: role || AUTH.ROLES.CUSTOMER });
-  await issueOtp(email, AUTH.OTP_PURPOSES.VERIFY_EMAIL);
+  // FIX: same bug as the frontend validators — email/phone must be trimmed
+  // before both the regex test and the DB lookup/save, otherwise incidental
+  // whitespace (autofill, copy-paste) makes a genuinely valid value fail
+  // validation, or fail to match an existing record on duplicate-check.
+  const trimmedEmail = (email || '').trim();
+  const trimmedPhone = (phone || '').trim();
 
-  return { email };
+  if (!validateEmail(trimmedEmail)) throw new Error(AUTH.EMAIL_RULE);
+  if (!AUTH.PHONE_REGEX.test(trimmedPhone)) throw new Error(AUTH.PHONE_RULE);
+  if (!AUTH.PASSWORD_REGEX.test(password)) throw new Error(AUTH.PASSWORD_RULE);
+
+  const [existingEmail, existingPhone] = await Promise.all([
+    User.findOne({ email: trimmedEmail }),
+    User.findOne({ phone: trimmedPhone }),
+  ]);
+
+  // FIX: registration used to block on ANY existing document with this
+  // email/phone, including one from a signup that was never verified. That
+  // permanently locked a customer out of their own email if OTP verification
+  // failed or was abandoned — they'd never actually been registered from the
+  // user's point of view. An unverified account is an abandoned attempt, not
+  // a real account, so it's fine to overwrite and restart rather than block.
+  if (existingEmail && existingEmail.isVerified) {
+    throw new Error('Email already registered');
+  }
+  if (
+    existingPhone &&
+    (existingPhone.isVerified || !existingEmail || String(existingPhone._id) !== String(existingEmail._id))
+  ) {
+    // Verified match, or an unverified match belonging to a *different*
+    // abandoned signup — ambiguous to silently overwrite, so block as before.
+    throw new Error('Phone number already registered');
+  }
+
+  const name = `${firstName.trim()} ${lastName.trim()}`;
+
+  if (existingEmail) {
+    // Restart the abandoned signup with the freshly submitted details.
+    existingEmail.firstName = firstName.trim();
+    existingEmail.lastName  = lastName.trim();
+    existingEmail.name      = name;
+    existingEmail.phone     = trimmedPhone;
+    existingEmail.password  = password; // pre-save hook re-hashes since this marks the path modified
+    await existingEmail.save();
+  } else {
+    await User.create({
+      firstName: firstName.trim(),
+      lastName:  lastName.trim(),
+      name,
+      email:    trimmedEmail,
+      password,
+      phone:    trimmedPhone,
+      role: AUTH.ROLES.CUSTOMER,
+    });
+  }
+  // FIX: use the same trimmed email used to save the account, not the raw
+  // parameter — otherwise a stray whitespace would issue the OTP under a
+  // different email than the one actually stored on the User document.
+  await issueOtp(trimmedEmail, AUTH.OTP_PURPOSES.VERIFY_EMAIL);
+
+  return { email: trimmedEmail };
 };
 
 /**

@@ -19,8 +19,8 @@ const userSchema = new mongoose.Schema(
     // them off a document that gets re-saved through this model. ──
     firstName:           { type: String },
     lastName:            { type: String },
-    verified:            { type: Boolean },
-    requiresPasswordChange: { type: Boolean },
+    verified:            { type: Boolean, default: false },
+    requiresPasswordChange: { type: Boolean, default: false },
     address:             { type: String },
     specializations:     [{ type: String }],
     nic:                 { type: String },
@@ -44,8 +44,8 @@ const userSchema = new mongoose.Schema(
     lifetimePoints:      { type: Number },
     badge:               { type: String },
     gpsStatus:           { type: String },
-    loyaltyPoints:       { type: Number },
-    isAvailable:         { type: Boolean },
+    loyaltyPoints:       { type: Number, default: 0 },
+    isAvailable:         { type: Boolean, default: true },
   },
   { timestamps: true }
 );

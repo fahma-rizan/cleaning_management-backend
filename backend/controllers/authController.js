@@ -9,11 +9,14 @@ const COOKIE_OPTIONS = {
 
 const register = async (req, res) => {
   try {
-    const { name, email, password, phone, role } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ success: false, message: 'Name, email and password are required' });
+    const { firstName, lastName, email, password, phone } = req.body;
+    if (!firstName || !lastName || !phone || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'First name, last name, phone, email and password are required',
+      });
     }
-    const result = await authService.registerUser({ name, email, password, phone, role });
+    const result = await authService.registerUser({ firstName, lastName, email, password, phone });
     res.status(201).json({ success: true, message: 'OTP sent to your email', data: result });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
