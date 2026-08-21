@@ -62,6 +62,7 @@ app.use('/api/complaints', require('./routes/complaintRoutes'));
 app.use('/api/reports',    require('./routes/reportRoutes'));
 app.use('/api/offers',     require('./routes/offerRoutes'));
 app.use('/api/pricelists', require('./routes/pricelistRoutes'));
+app.use('/api/services',   require('./routes/serviceRoutes'));
 app.use('/api/payments',   require('./routes/paymentRoutes'));
 app.use('/api/settings',   require('./routes/settingsRoutes'));
 app.use('/api/gps',        require('./routes/gpsRoutes'));
