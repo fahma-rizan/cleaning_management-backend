@@ -47,6 +47,18 @@ const io = new Server(server, {
 app.set('io', io); // controllers reach it via req.app.get('io')
 io.on('connection', (socket) => {
   console.log(`🔌 GPS socket connected: ${socket.id}`);
+
+  // Client emits 'register' with their userId right after connecting so
+  // targeted notifications (invoiceUpdate, etc.) can reach just them, via a
+  // private room keyed by userId. Ported from backend-payment-workflow.
+  socket.on('register', (userId) => {
+    if (!userId) return;
+    socket.join(`user:${userId}`);
+  });
+
+  // Admin clients join a shared room to receive broadcast admin events.
+  socket.on('joinAdminRoom', () => socket.join('admin-room'));
+
   socket.on('disconnect', () => console.log(`🔌 GPS socket disconnected: ${socket.id}`));
 });
 
@@ -83,6 +95,12 @@ app.use('/api/notifications',    require('./routes/notificationRoutes'));
 app.use('/api/audit',            require('./routes/auditRoutes'));
 app.use('/api/staff-requests',   require('./routes/staffRequestRoutes'));
 
+// ─── ported from backend-payment-workflow ──────────────────────────────────────
+app.use('/api/notification-templates', require('./routes/notificationTemplates'));
+app.use('/api/payment-report',         require('./routes/paymentReport'));
+app.use('/api/payment-reminders',      require('./routes/paymentReminders'));
+app.use('/api/assistant',              require('./routes/assistantRoutes'));
+
 // Health check - open this in browser to confirm server is working
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'Cloud Laundry Backend is running!' });
@@ -92,4 +110,7 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
   console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
+
+  // Automatic balance-due reminder emails — ported from backend-payment-workflow.
+  require('./utils/reminderScheduler').startReminderScheduler();
 });
