@@ -1,5 +1,119 @@
 const Complaint = require('../models/Complaint');
 const User      = require('../models/User');
+const Booking   = require('../models/Booking');
+
+// Pulls in everything the complaint document doesn't store itself: the
+// customer's live contact info, and the booking's paid amount and actual
+// completion date. Ported from feature/admin-reviews-complaints — the
+// admin ComplaintsManagement.tsx UI already reads these fields, but this
+// backend never enriched the response with them.
+//
+// Two different "staff" concerns get kept separate here:
+//  - serviceStaffName: who actually performed the booking (recomputed
+//    fresh from the booking's team every time — purely informational).
+//  - assignedStaffName/assignedStaffId: who is currently assigned to
+//    *handle this complaint*, set via the "Assign to" dropdown. This must
+//    stay whatever was last manually assigned — it is NOT recomputed from
+//    the booking. If nobody has been assigned yet, it defaults to the
+//    booking's staff (same as at complaint-creation time) purely as a
+//    sensible starting point for the dropdown.
+const enrichComplaint = async (complaint) => {
+  const obj = complaint.toObject ? complaint.toObject() : complaint;
+
+  const [customer, booking] = await Promise.all([
+    User.findById(obj.customerId).select('email phone'),
+    obj.bookingId ? Booking.findById(obj.bookingId) : null,
+  ]);
+
+  let serviceStaffName = '';
+  let defaultStaffId = '';
+  let paidAmount = 0;
+  let serviceDate = obj.serviceDate;
+
+  if (booking) {
+    const names = [];
+    if (booking.assignedStaffName) names.push(booking.assignedStaffName);
+    if (booking.assignedTeam && booking.assignedTeam.length > 0) {
+      booking.assignedTeam.forEach((m) => {
+        if (m.staffName && !names.includes(m.staffName)) names.push(m.staffName);
+      });
+    }
+    serviceStaffName = names.join(', ');
+
+    defaultStaffId = booking.assignedStaffId
+      ? String(booking.assignedStaffId)
+      : (booking.assignedTeam?.[0]?.staffId ? String(booking.assignedTeam[0].staffId) : '');
+
+    paidAmount = booking.paidAmount || 0;
+    serviceDate = booking.completedAt || (booking.date ? new Date(booking.date) : obj.serviceDate);
+  }
+
+  // Some pre-existing complaint documents were written by an older code path
+  // that stored the assigned staff under `assignedStaff` instead of the
+  // current `assignedStaffId` — fall back to it so already-assigned staff
+  // don't silently disappear from the admin UI.
+  const storedStaffId = obj.assignedStaffId || obj.assignedStaff;
+
+  return {
+    ...obj,
+    customerEmail: customer?.email || '',
+    customerPhone: customer?.phone || '',
+    serviceStaffName,
+    assignedStaffName: obj.assignedStaffName || serviceStaffName,
+    assignedStaffId: storedStaffId ? String(storedStaffId) : defaultStaffId,
+    paidAmount,
+    serviceDate,
+  };
+};
+
+// ─── POST /api/complaints ──────────────────────────────────────────────────────────
+// Customer submits a complaint for one of their own completed bookings.
+const createComplaint = async (req, res) => {
+  try {
+    const { bookingId, title, description, priority } = req.body;
+    const customerId = req.user._id;
+
+    if (!bookingId || !title?.trim() || !description?.trim()) {
+      return res.status(400).json({ error: 'bookingId, title and description are required' });
+    }
+
+    const booking = /^[0-9a-fA-F]{24}$/.test(bookingId)
+      ? await Booking.findById(bookingId)
+      : await Booking.findOne({ bookingId });
+    if (!booking) return res.status(404).json({ error: 'Booking not found' });
+
+    if (String(booking.customerId) !== String(customerId)) {
+      return res.status(403).json({ error: 'This booking does not belong to you' });
+    }
+    if ((booking.status || '').toLowerCase() !== 'completed') {
+      return res.status(400).json({ error: 'You can only submit a complaint for completed bookings' });
+    }
+
+    const assignedStaffName = booking.assignedTeam && booking.assignedTeam.length > 0
+      ? booking.assignedTeam.map(m => m.staffName).filter(Boolean).join(', ')
+      : (booking.assignedStaffName || '');
+
+    const serviceDate = booking.date ? new Date(booking.date) : new Date();
+
+    const complaint = await Complaint.create({
+      bookingId:    booking._id,
+      title:        title.trim(),
+      description:  description.trim(),
+      customerId,
+      customerName: booking.customerName || req.user.name || 'Customer',
+      serviceName:  booking.serviceName || booking.serviceType,
+      serviceDate:  isNaN(serviceDate.getTime()) ? new Date().toISOString() : serviceDate.toISOString(),
+      assignedStaffName,
+      priority: ['High', 'Medium', 'Low'].includes(priority) ? priority : 'Medium',
+      status: 'Pending',
+    });
+
+    res.status(201).json(complaint);
+  } catch (err) {
+    console.error('createComplaint error:', err);
+    res.status(500).json({ error: 'Failed to submit complaint' });
+  }
+};
 
 // ─── GET /api/complaints ──────────────────────────────────────────────────────────
 const getAllComplaints = async (req, res) => {
@@ -15,7 +129,8 @@ const getAllComplaints = async (req, res) => {
       ];
     }
     const complaints = await Complaint.find(filter).sort({ createdAt: -1 });
-    res.json(complaints);
+    const enriched = await Promise.all(complaints.map(enrichComplaint));
+    res.json(enriched);
   } catch (err) {
     console.error('getAllComplaints error:', err);
     res.status(500).json({ error: 'Failed to load complaints' });
@@ -27,7 +142,8 @@ const getComplaintById = async (req, res) => {
   try {
     const complaint = await Complaint.findById(req.params.id);
     if (!complaint) return res.status(404).json({ error: 'Complaint not found' });
-    res.json(complaint);
+    const enriched = await enrichComplaint(complaint);
+    res.json(enriched);
   } catch (err) {
     console.error('getComplaintById error:', err);
     res.status(500).json({ error: 'Failed to load complaint' });
@@ -100,5 +216,5 @@ const addNote = async (req, res) => {
 };
 
 module.exports = {
-  getAllComplaints, getComplaintById, updateStatus, updatePriority, assignStaff, addNote,
+  createComplaint, getAllComplaints, getComplaintById, updateStatus, updatePriority, assignStaff, addNote,
 };
