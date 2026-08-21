@@ -2,6 +2,14 @@ const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const sendEmail = require('../utils/sendEmail');
 
+// ─── Validation rules (ported from feature/auth-loyalty-inventory-backend) ────
+// Sri Lankan mobile numbers in +94 international format.
+const PHONE_REGEX = /^\+94(70|71|72|74|75|76|77|78)\d{7}$/;
+const PHONE_RULE  = 'Enter a valid Sri Lankan phone number (e.g. +94771234567).';
+// min 8 chars, at least 1 lowercase, 1 uppercase, 1 number, 1 special character.
+const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
+const PASSWORD_RULE  = 'Minimum 8 characters with uppercase, lowercase, number and special character.';
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 const generateToken = (id) =>
@@ -27,13 +35,27 @@ const otpEmailHTML = (name, otp, action = 'Verify Your Email') => `
 // POST /api/auth/register
 const register = async (req, res) => {
   try {
-    const { firstName, lastName, email, phone, password } = req.body;
+    const { firstName, lastName, password } = req.body;
+    // FIX: trim email/phone before validating or saving — otherwise stray
+    // whitespace (autofill, copy-paste) makes a genuinely valid value fail
+    // its regex, or fail to match an existing record on duplicate-check.
+    const email = (req.body.email || '').trim();
+    const phone = (req.body.phone || '').trim();
 
-    if (!firstName || !lastName || !email || !password) {
+    if (!firstName || !lastName || !email || !phone || !password) {
       return res.status(400).json({ success: false, message: 'All fields are required.' });
     }
+    if (!PHONE_REGEX.test(phone)) {
+      return res.status(400).json({ success: false, message: PHONE_RULE });
+    }
+    if (!PASSWORD_REGEX.test(password)) {
+      return res.status(400).json({ success: false, message: PASSWORD_RULE });
+    }
 
-    const existing = await User.findOne({ email: email.toLowerCase() });
+    const [existing, existingPhone] = await Promise.all([
+      User.findOne({ email: email.toLowerCase() }),
+      User.findOne({ phone }),
+    ]);
 
     if (existing) {
       if (existing.isVerified) {
@@ -42,8 +64,19 @@ const register = async (req, res) => {
           message: 'This email is already registered. Please Sign In.',
         });
       }
-      // Not verified yet — resend OTP
+      // Not verified yet — resend OTP. Only block if the phone actually
+      // changed to one already claimed by a genuinely different account —
+      // resubmitting the same phone this account already has must never
+      // block just because the lookup happens to resolve to another
+      // unverified duplicate sharing that number.
+      if (phone !== existing.phone && existingPhone && String(existingPhone._id) !== String(existing._id)) {
+        return res.status(400).json({ success: false, message: 'Phone number already registered.' });
+      }
       const otp = generateOTP();
+      existing.firstName = firstName;
+      existing.lastName  = lastName;
+      existing.phone     = phone;
+      existing.password  = password; // pre-save hook re-hashes since this marks the path modified
       existing.otp = otp;
       existing.otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
       await existing.save();
@@ -51,6 +84,10 @@ const register = async (req, res) => {
       console.log(`\n📌 OTP for ${email}: ${otp}\n`);
       await sendEmail({ to: email, subject: 'Cloud Laundry – Verify Your Email', html: otpEmailHTML(firstName, otp) });
       return res.json({ success: true, message: 'OTP sent to your email address.' });
+    }
+
+    if (existingPhone && existingPhone.isVerified) {
+      return res.status(400).json({ success: false, message: 'Phone number already registered.' });
     }
 
     const otp = generateOTP();
