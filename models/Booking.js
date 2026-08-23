@@ -97,6 +97,12 @@ const bookingSchema = new mongoose.Schema(
     // — Service-specific fields ————————————————————————————————————————————————
     // Home / Office Cleaning
     houseSize:           { type: String, enum: ['small', 'medium', 'large', 'xl', 'office'] },
+    // FIX: the booking form has always collected this (bookingData.squareFeet,
+    // used for per-sqft pricing on Deep Cleaning/Floor Cleaning/etc.) but the
+    // schema never declared it, so Mongoose's default strict mode silently
+    // dropped it on every save — it was never actually persisted. Needed now
+    // for area-based staff-count calculation, but the bug existed regardless.
+    squareFeet:          { type: Number },
     rooms:               { type: Number },
     bathrooms:           { type: Number },
     frequency:           { type: String, enum: ['once', 'weekly', 'biweekly', 'monthly'] },
@@ -119,6 +125,10 @@ const bookingSchema = new mongoose.Schema(
     sofaSeatingCapacity: { type: Number },
     mattressCount:       { type: Number },
     mattressSquareFeet:  { type: Number },
+    // Staff count for mattress cleaning is driven by size, not the existing
+    // mattressCount pricing field — added alongside it, doesn't touch pricing.
+    mattressSize:          { type: String, enum: ['Single', 'Double', 'Queen', 'King'] },
+    mattressCleaningLevel: { type: String, enum: ['Full', 'Top Only'] },
     carpetCount:         { type: Number },
     carpetSquareFeet:    { type: Number },
 

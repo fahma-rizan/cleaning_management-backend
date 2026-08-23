@@ -17,12 +17,44 @@ const TIME_SLOTS = [
 
 const ACTIVE_STATUSES = ['pending', 'confirmed', 'in-progress'];
 
-// Returns true if the service needs a team of 3 (Home Cleaning, Sofa/Mattress)
-// Laundry and Curtain → single staff only
-const requiresTeam = (booking) => {
+// How many staff a booking needs — scales with the service's size/quantity,
+// not a fixed team size. The selected time slot/duration never changes,
+// only the headcount. `booking` can be a real Booking doc, the raw create-
+// booking req.body, or a slot-check query object — all three carry the same
+// field names.
+const MATTRESS_STAFF_BY_SIZE = { Single: 1, Double: 2, Queen: 3, King: 3 };
+const SQFT_PER_STAFF = 500; // 1-500→1, 501-1000→2, ... (Math.ceil handles it)
+const SEATS_PER_STAFF = 6;  // sofa: 1 staff per 6 seats
+
+const getRequiredStaffCount = (booking) => {
   const text = [booking.serviceName, booking.serviceType, booking.serviceCategory]
     .filter(Boolean).join(' ').toLowerCase();
-  return !(text.includes('laundry') || text.includes('curtain'));
+
+  // Laundry & Curtain — always exactly 1, regardless of quantity.
+  if (text.includes('laundry') || text.includes('curtain')) return 1;
+
+  // Sofa cleaning — by seating capacity.
+  if (text.includes('sofa')) {
+    const seats = Number(booking.sofaSeatingCapacity) || 1;
+    return Math.max(1, Math.ceil(seats / SEATS_PER_STAFF));
+  }
+
+  // Mattress cleaning — by size only; cleaning level (Full/Top Only) never
+  // changes the staff count.
+  if (text.includes('mattress')) {
+    return MATTRESS_STAFF_BY_SIZE[booking.mattressSize] || 1;
+  }
+
+  // Carpet cleaning — by square feet.
+  if (text.includes('carpet')) {
+    const sqft = Number(booking.carpetSquareFeet) || Number(booking.squareFeet) || 1;
+    return Math.max(1, Math.ceil(sqft / SQFT_PER_STAFF));
+  }
+
+  // Everything else (Home/Office/Deep Cleaning/Floor Cleaning/Commercial/
+  // General) — by square feet.
+  const sqft = Number(booking.squareFeet) || 1;
+  return Math.max(1, Math.ceil(sqft / SQFT_PER_STAFF));
 };
 
 // Maps service text to the closest specialization
@@ -98,8 +130,8 @@ const getBusyStaffIds = async (date, time, excludeBookingId = null) => {
 // blurred/blocked a slot purely on booking count regardless of whether
 // staff were actually free.
 const getSlotStaffAvailability = async (date, time, serviceInfo = {}, excludeBookingId = null) => {
-  const isTeam = requiresTeam(serviceInfo);
-  const spec   = getRequiredSpecialization(serviceInfo);
+  const requiredCount = getRequiredStaffCount(serviceInfo);
+  const spec           = getRequiredSpecialization(serviceInfo);
 
   // Same rule autoAssignBooking uses: today only counts staff currently
   // marked available; a future date can use any active staff since their
@@ -109,6 +141,10 @@ const getSlotStaffAvailability = async (date, time, serviceInfo = {}, excludeBoo
 
   const busyIds = await getBusyStaffIds(date, time, excludeBookingId);
 
+  // This is also what makes date-level capacity blocking work automatically:
+  // if 8 of 10 qualified staff are already booked for this slot (busyIds),
+  // candidateCount is 2 — a request needing 4 gets blocked, one needing 2
+  // still fits, with no separate "capacity" concept needed.
   const candidateCount = await User.countDocuments({
     role:            'staff',
     specializations: spec,
@@ -116,16 +152,16 @@ const getSlotStaffAvailability = async (date, time, serviceInfo = {}, excludeBoo
     ...availFilter,
   });
 
-  const requiredCount = isTeam ? 3 : 1; // team services (Home/Office, Sofa/Mattress) need a full team of 3
-  return { available: candidateCount >= requiredCount, spec, isTeam, candidateCount, requiredCount };
+  return { available: candidateCount >= requiredCount, spec, candidateCount, requiredCount };
 };
 
-// Internal: assign a booking to staff (team of 3 or single depending on service)
+// Internal: assign a booking to staff. Headcount scales with the service's
+// size/quantity (getRequiredStaffCount) — not a fixed team size.
 // isAvailable is only relevant for TODAY. Future bookings can use any active staff.
 const autoAssignBooking = async (booking) => {
   try {
-    const isTeam   = requiresTeam(booking);
-    const spec     = getRequiredSpecialization(booking);
+    const requiredCount = getRequiredStaffCount(booking);
+    const spec           = getRequiredSpecialization(booking);
     const todayStr = getTodayLocalStr();
     const isToday  = booking.date === todayStr;
 
@@ -142,49 +178,29 @@ const autoAssignBooking = async (booking) => {
       _id:             { $nin: [...busyIds] },
       ...availFilter,
     });
-    //change staff count for team and single staff booking
-    if (isTeam) {
-      // Strictly require exactly 3 qualified staff — do not partially assign
-      if (candidates.length < 3) {
-        booking.needsAdminAttention     = true;
-        booking.adminNotificationReason =
-          `Not enough qualified staff (${spec}) for ${booking.date} at ${booking.time}. ` +
-          `Need 3, only ${candidates.length} available. Others may be busy or lack this specialization.`;
-        await booking.save();
-        return;
-      }
 
-      //teambooking
-      const chosen = await pickLeastLoaded(candidates, 3);
-      booking.assignedTeam = chosen.map(s => ({
-        staffId:    s._id,
-        staffName:  s.name,
-        staffEmail: s.email,
-      }));
-      booking.assignedStaffId    = chosen[0]._id;
-      booking.assignedStaffName  = chosen[0].name;
-      booking.assignedStaffEmail = chosen[0].email;
-      booking.needsAdminAttention     = false;
-      booking.adminNotificationReason = '';
-    } else {
-      // Single-staff service — must have the required specialization
-      if (candidates.length === 0) {
-        booking.needsAdminAttention     = true;
-        booking.adminNotificationReason =
-          `No qualified staff (${spec}) available for ${booking.date} at ${booking.time}. ` +
-          `Staff may be busy at this time or lack this specialization.`;
-        await booking.save();
-        return;
-      }
-
-      //singlestaffbooking
-      const chosen = await pickLeastLoaded(candidates, 1);
-      booking.assignedStaffId    = chosen[0]._id;
-      booking.assignedStaffName  = chosen[0].name;
-      booking.assignedStaffEmail = chosen[0].email;
-      booking.needsAdminAttention     = false;
-      booking.adminNotificationReason = '';
+    // Strictly require the full headcount — do not partially assign
+    if (candidates.length < requiredCount) {
+      booking.needsAdminAttention     = true;
+      booking.adminNotificationReason =
+        `Not enough qualified staff (${spec}) for ${booking.date} at ${booking.time}. ` +
+        `Need ${requiredCount}, only ${candidates.length} available. Others may be busy or lack this specialization.`;
+      await booking.save();
+      return;
     }
+
+    const chosen = await pickLeastLoaded(candidates, requiredCount);
+    // assignedTeam stays empty for single-staff bookings — every existing UI
+    // that checks `assignedTeam.length > 0` to detect a team booking keeps
+    // working unchanged regardless of how big teams get.
+    booking.assignedTeam = requiredCount > 1
+      ? chosen.map(s => ({ staffId: s._id, staffName: s.name, staffEmail: s.email }))
+      : [];
+    booking.assignedStaffId    = chosen[0]._id;
+    booking.assignedStaffName  = chosen[0].name;
+    booking.assignedStaffEmail = chosen[0].email;
+    booking.needsAdminAttention     = false;
+    booking.adminNotificationReason = '';
 
     await booking.save();
   } catch (err) {
@@ -290,10 +306,19 @@ const getAssignedBookings = async (req, res) => {
 // staff the requested service at that date+time.
 const checkSlotAvailability = async (req, res) => {
   try {
-    const { date, serviceName, serviceType, serviceCategory } = req.query;
+    const {
+      date, serviceName, serviceType, serviceCategory,
+      squareFeet, sofaSeatingCapacity, mattressSize, carpetSquareFeet,
+    } = req.query;
     if (!date) return res.status(400).json({ success: false, message: 'date is required' });
 
-    const serviceInfo = { serviceName, serviceType, serviceCategory };
+    // Quantity fields determine headcount (getRequiredStaffCount) the same
+    // way they will on the actual booking — so slot availability reflects
+    // the size/quantity the customer has entered, not just the service type.
+    const serviceInfo = {
+      serviceName, serviceType, serviceCategory,
+      squareFeet, sofaSeatingCapacity, mattressSize, carpetSquareFeet,
+    };
     const slotAvailability = {};
     for (const slot of TIME_SLOTS) {
       const { available } = await getSlotStaffAvailability(date, slot, serviceInfo);
