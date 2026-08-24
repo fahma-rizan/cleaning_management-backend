@@ -2,3 +2,5 @@ uploads/*
 !uploads/.gitignore
 !uploads/staff
 !uploads/staff/.gitkeep
+!uploads/admin
+!uploads/admin/.gitkeep

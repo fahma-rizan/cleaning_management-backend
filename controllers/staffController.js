@@ -2,6 +2,8 @@ const User    = require('../models/User');
 const Booking = require('../models/Booking');
 const bcrypt  = require('bcryptjs');
 const { getTodayLocalStr } = require('../utils/dateUtils');
+const sendEmail = require('../utils/sendEmail');
+const { normalizePhone, PHONE_RULE, EMAIL_REGEX, EMAIL_RULE, generateStrongPassword, credentialsEmailHTML } = require('../utils/validators');
 
 const ACTIVE_STATUSES = ['pending', 'confirmed', 'in-progress'];
 
@@ -530,10 +532,14 @@ const getAvailableStaffV2 = async (req, res) => {
 // ─── POST /api/staff (multipart/form-data) ────────────────────────────────────
 const createStaffV2 = async (req, res) => {
   try {
-    const { name, email, phone, nic, address, specifications, status } = req.body;
-    if (!name || !email || !phone) {
+    const { name, email, nic, address, specifications, status } = req.body;
+    const rawPhone = req.body.phone;
+    if (!name || !email || !rawPhone) {
       return res.status(400).json({ error: 'Name, email and phone are required.' });
     }
+    if (!EMAIL_REGEX.test(email)) return res.status(400).json({ error: EMAIL_RULE });
+    const phone = normalizePhone(rawPhone);
+    if (!phone) return res.status(400).json({ error: PHONE_RULE });
 
     const existing = await User.findOne({ email: email.toLowerCase() });
     if (existing) return res.status(400).json({ error: 'An account with this email already exists.' });
@@ -541,6 +547,11 @@ const createStaffV2 = async (req, res) => {
     const nameParts = name.trim().split(' ');
     let parsedSpecs = [];
     try { parsedSpecs = specifications ? JSON.parse(specifications) : []; } catch { parsedSpecs = []; }
+
+    // Auto-generate the temporary password — nobody types or reuses a fixed
+    // one anymore. It's emailed below and never returned in the API response;
+    // the staff member sets their own password on first login (requiresPasswordChange).
+    const tempPassword = generateStrongPassword();
 
     const staff = await User.create({
       firstName: nameParts[0],
@@ -550,7 +561,7 @@ const createStaffV2 = async (req, res) => {
       phone,
       nic:       nic     || '',
       address:   address || '',
-      password:  'staff123',
+      password:  tempPassword,
       role:      'staff',
       isVerified: true,
       requiresPasswordChange: true,
@@ -559,7 +570,13 @@ const createStaffV2 = async (req, res) => {
       profilePhoto: req.file ? `/uploads/staff/${req.file.filename}` : '',
     });
 
-    res.status(201).json(toStaffMember(staff));
+    const emailed = await sendEmail({
+      to: staff.email,
+      subject: 'Cloud Laundry – Your Staff Account',
+      html: credentialsEmailHTML(staff.name, staff.email, tempPassword, 'staff account'),
+    });
+
+    res.status(201).json({ ...toStaffMember(staff), credentialsEmailed: emailed });
   } catch (err) {
     console.error('createStaffV2 error:', err);
     res.status(500).json({ error: 'Failed to create staff' });

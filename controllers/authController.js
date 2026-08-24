@@ -1,14 +1,7 @@
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const sendEmail = require('../utils/sendEmail');
-
-// ─── Validation rules (ported from feature/auth-loyalty-inventory-backend) ────
-// Sri Lankan mobile numbers in +94 international format.
-const PHONE_REGEX = /^\+94(70|71|72|74|75|76|77|78)\d{7}$/;
-const PHONE_RULE  = 'Enter a valid Sri Lankan phone number (e.g. +94771234567).';
-// min 8 chars, at least 1 lowercase, 1 uppercase, 1 number, 1 special character.
-const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
-const PASSWORD_RULE  = 'Minimum 8 characters with uppercase, lowercase, number and special character.';
+const { normalizePhone, PHONE_RULE, PASSWORD_REGEX, PASSWORD_RULE } = require('../utils/validators');
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -40,12 +33,15 @@ const register = async (req, res) => {
     // whitespace (autofill, copy-paste) makes a genuinely valid value fail
     // its regex, or fail to match an existing record on duplicate-check.
     const email = (req.body.email || '').trim();
-    const phone = (req.body.phone || '').trim();
+    const rawPhone = (req.body.phone || '').trim();
 
-    if (!firstName || !lastName || !email || !phone || !password) {
+    if (!firstName || !lastName || !email || !rawPhone || !password) {
       return res.status(400).json({ success: false, message: 'All fields are required.' });
     }
-    if (!PHONE_REGEX.test(phone)) {
+    // Accepts local (0771234567) or international (+94771234567) input and
+    // stores the canonical +94 form either way — see normalizePhone.
+    const phone = normalizePhone(rawPhone);
+    if (!phone) {
       return res.status(400).json({ success: false, message: PHONE_RULE });
     }
     if (!PASSWORD_REGEX.test(password)) {
@@ -292,8 +288,8 @@ const resetPassword = async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    if (!password || password.length < 8) {
-      return res.status(400).json({ success: false, message: 'Password must be at least 8 characters.' });
+    if (!password || !PASSWORD_REGEX.test(password)) {
+      return res.status(400).json({ success: false, message: PASSWORD_RULE });
     }
 
     const user = await User.findOne({ email: email.toLowerCase() });
@@ -331,8 +327,8 @@ const staffChangePassword = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Temporary password is incorrect.' });
     }
 
-    if (newPassword.length < 8) {
-      return res.status(400).json({ success: false, message: 'New password must be at least 8 characters.' });
+    if (!PASSWORD_REGEX.test(newPassword)) {
+      return res.status(400).json({ success: false, message: PASSWORD_RULE });
     }
 
     user.password = newPassword;
@@ -350,11 +346,50 @@ const staffChangePassword = async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
+        adminRole: user.adminRole,
         requiresPasswordChange: false,
       },
     });
   } catch (err) {
     console.error('staffChangePassword error:', err);
+    res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+  }
+};
+
+// POST /api/auth/change-password (authenticated — protect middleware)
+// Self-service password change from a logged-in session (e.g. Customer
+// Dashboard > Settings > Security). Different from staffChangePassword above:
+// this one identifies the user from the JWT (req.user), not from an email
+// field in the body, and doesn't touch requiresPasswordChange.
+const changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Current and new password are required.' });
+    }
+
+    const user = await User.findById(req.user._id).select('+password');
+    if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
+
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      return res.status(401).json({ success: false, message: 'Current password is incorrect.' });
+    }
+
+    if (!PASSWORD_REGEX.test(newPassword)) {
+      return res.status(400).json({ success: false, message: PASSWORD_RULE });
+    }
+
+    if (currentPassword === newPassword) {
+      return res.status(400).json({ success: false, message: 'New password must be different from your current password.' });
+    }
+
+    user.password = newPassword;
+    await user.save();
+
+    res.json({ success: true, message: 'Password changed successfully.' });
+  } catch (err) {
+    console.error('changePassword error:', err);
     res.status(500).json({ success: false, message: 'Server error. Please try again.' });
   }
 };
@@ -368,4 +403,5 @@ module.exports = {
   verifyResetCode,
   resetPassword,
   staffChangePassword,
+  changePassword,
 };

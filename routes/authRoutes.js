@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { protect } = require('../middleware/authMiddleware');
 const {
   register,
   verifyOTP,
@@ -9,6 +10,7 @@ const {
   verifyResetCode,
   resetPassword,
   staffChangePassword,
+  changePassword,
 } = require('../controllers/authController');
 
 router.post('/register',                register);
@@ -19,5 +21,6 @@ router.post('/forgot-password',         forgotPassword);
 router.post('/verify-reset-code',       verifyResetCode);
 router.post('/reset-password',          resetPassword);
 router.post('/staff-change-password',   staffChangePassword);
+router.post('/change-password',         protect, changePassword);
 
 module.exports = router;
