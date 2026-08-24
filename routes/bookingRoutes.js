@@ -18,6 +18,7 @@ const {
   cancelBooking,
   startTask,
   completeTask,
+  updateLaundryStatus,
   markCashReceived,
   declineTask,
   getAllBookings,
@@ -57,6 +58,7 @@ router.patch('/:id/reschedule',        protect, validate(rescheduleSchema), resc
 router.patch('/:id/cancel',            protect, validate(cancelSchema), cancelBooking);
 router.patch('/:id/start',             protect, startTask);
 router.patch('/:id/complete',          protect, completeTask);
+router.patch('/:id/laundry-status',    protect, updateLaundryStatus);
 router.patch('/:id/cash-received',     protect, markCashReceived);
 router.patch('/:id/decline',           protect, validate(declineSchema), declineTask);
 router.patch('/:id/resolve-attention', protect, adminOnly, resolveAttention);

@@ -13,4 +13,25 @@ const getTodayLocalStr = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
-module.exports = { getTodayLocalStr };
+// Formats a Date object as 'YYYY-MM-DD' using its LOCAL calendar day (same
+// convention as getTodayLocalStr / the frontend's toLocalDateStr) — never
+// use toISOString() here for the same reason noted above.
+const toLocalDateStr = (date) =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+
+// Adds `days` WORKING days (Mon-Fri, Sat/Sun skipped) to a 'YYYY-MM-DD'
+// date string. Used to auto-calculate a laundry booking's delivery date
+// from its pickup date (2 working days later).
+const addWorkingDays = (dateStr, days) => {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  let added = 0;
+  while (added < days) {
+    date.setDate(date.getDate() + 1);
+    const dow = date.getDay(); // 0 = Sunday, 6 = Saturday
+    if (dow !== 0 && dow !== 6) added++;
+  }
+  return toLocalDateStr(date);
+};
+
+module.exports = { getTodayLocalStr, toLocalDateStr, addWorkingDays };

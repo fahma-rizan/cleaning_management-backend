@@ -115,6 +115,27 @@ const bookingSchema = new mongoose.Schema(
     laundrySelectedItems:  { type: mongoose.Schema.Types.Mixed },
     laundryPickupDelivery: { type: Boolean, default: false },
 
+    // Laundry pickup + delivery — `date`/`time` above ARE the pickup slot
+    // (same fields every other service uses); delivery is a separate slot
+    // with its own independent staff assignment, auto-calculated as 2
+    // working days after pickup. Only populated for laundry bookings.
+    deliveryDate:        { type: String }, // YYYY-MM-DD
+    deliveryTime:        { type: String }, // one of TIME_SLOTS
+    deliveryStaffId:     { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    deliveryStaffName:   { type: String },
+    deliveryStaffEmail:  { type: String },
+    deliveryCompletedAt: { type: Date },
+    // Simple 5-stage laundry-specific flow — separate from the generic
+    // `status` above (which every service type shares and everything else
+    // in the app already filters/counts by). Kept in sync with `status`
+    // via a coarse mapping so nothing that only reads `status` needs to
+    // change: booking-confirmed→confirmed, picked-up/in-progress/delivered
+    // →in-progress, completed→completed.
+    laundryStatus: {
+      type: String,
+      enum: ['booking-confirmed', 'picked-up', 'in-progress', 'delivered', 'completed'],
+    },
+
     // Curtain
     curtainServiceType: { type: String },
     curtainOptions:     [{ type: String }],

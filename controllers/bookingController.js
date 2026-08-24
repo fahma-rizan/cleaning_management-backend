@@ -2,7 +2,7 @@ const Booking             = require('../models/Booking');
 const User                = require('../models/User');
 const TaskDeclineRequest  = require('../models/TaskDeclineRequest');
 const sendEmail = require('../utils/sendEmail');
-const { getTodayLocalStr } = require('../utils/dateUtils');
+const { getTodayLocalStr, addWorkingDays } = require('../utils/dateUtils');
 const { awardPointsForBooking } = require('./loyaltyController');
 
 // Keep in sync with TIME_SLOTS in validators/bookingValidators.js.
@@ -107,19 +107,44 @@ const getScheduledDateTime = (booking) => {
   return new Date(year, month - 1, day, slot.h, slot.m, 0);
 };
 
-// Returns the set of staff IDs already assigned to any booking on the same date+time
+// Returns the set of staff IDs already occupied at this exact date+time —
+// either as a normal booking's pickup/service slot, OR as a laundry
+// booking's independently-scheduled delivery slot. A staff member's pickup
+// and delivery legs can land on different days/slots for different
+// bookings, so both sides have to be checked against every candidate slot,
+// not just the booking's primary date/time.
 // (excludes the booking itself so reschedule doesn't block its own staff)
 const getBusyStaffIds = async (date, time, excludeBookingId = null) => {
-  const filter = { date, time, status: { $in: ACTIVE_STATUSES } };
-  if (excludeBookingId) filter._id = { $ne: excludeBookingId };
+  const baseFilter = { status: { $in: ACTIVE_STATUSES } };
+  if (excludeBookingId) baseFilter._id = { $ne: excludeBookingId };
 
-  const conflicts = await Booking.find(filter).select('assignedStaffId assignedTeam');
+  const conflicts = await Booking.find({
+    ...baseFilter,
+    $or: [
+      { date, time },
+      { deliveryDate: date, deliveryTime: time },
+    ],
+  }).select('assignedStaffId assignedTeam deliveryStaffId date time deliveryDate deliveryTime');
+
   const busy = new Set();
   conflicts.forEach(b => {
-    if (b.assignedStaffId) busy.add(b.assignedStaffId.toString());
-    (b.assignedTeam || []).forEach(m => busy.add(m.staffId.toString()));
+    if (b.date === date && b.time === time) {
+      if (b.assignedStaffId) busy.add(b.assignedStaffId.toString());
+      (b.assignedTeam || []).forEach(m => busy.add(m.staffId.toString()));
+    }
+    if (b.deliveryDate === date && b.deliveryTime === time && b.deliveryStaffId) {
+      busy.add(b.deliveryStaffId.toString());
+    }
   });
   return busy;
+};
+
+// Whether `serviceInfo` (serviceName/serviceType/serviceCategory) describes
+// the core Laundry service — the only one with a real pickup+delivery flow.
+const isLaundryBooking = (serviceInfo = {}) => {
+  const text = [serviceInfo.serviceName, serviceInfo.serviceType, serviceInfo.serviceCategory]
+    .filter(Boolean).join(' ').toLowerCase();
+  return text.includes('laundry');
 };
 
 // Whether a given date+time slot has enough qualified, unbooked staff to
@@ -208,10 +233,90 @@ const autoAssignBooking = async (booking) => {
   }
 };
 
+// Internal: assigns a laundry booking's pickup and delivery legs
+// INDEPENDENTLY — each checked against staff availability for its own
+// date+time. They can land on the same staff member (if free both times)
+// or two different people; nothing forces either way. Partial success is
+// allowed: e.g. pickup gets staffed but delivery can't yet — the booking
+// still moves forward with needsAdminAttention flagging just the delivery
+// side, instead of failing the whole booking.
+const autoAssignLaundryBooking = async (booking) => {
+  try {
+    const spec     = getRequiredSpecialization(booking); // 'Laundry Service'
+    const todayStr = getTodayLocalStr();
+
+    const findOneFor = async (date, time, excludeIds = []) => {
+      const availFilter = date === todayStr ? { isAvailable: true } : {};
+      const busyIds = await getBusyStaffIds(date, time, booking._id);
+      const candidates = await User.find({
+        role:            'staff',
+        specializations: spec,
+        _id:             { $nin: [...busyIds, ...excludeIds] },
+        ...availFilter,
+      });
+      if (candidates.length === 0) return null;
+      const [chosen] = await pickLeastLoaded(candidates, 1);
+      return chosen;
+    };
+
+    const pickupStaff = await findOneFor(booking.date, booking.time);
+    // Delivery is checked independently — the pickup staff member is only
+    // excluded from delivery consideration if they're genuinely busy at the
+    // delivery date+time (handled inside getBusyStaffIds via other
+    // bookings); being this booking's pickup staff does not itself block
+    // them from also taking the delivery leg.
+    const deliveryStaff = await findOneFor(booking.deliveryDate, booking.deliveryTime);
+
+    const problems = [];
+
+    if (pickupStaff) {
+      booking.assignedStaffId    = pickupStaff._id;
+      booking.assignedStaffName  = pickupStaff.name;
+      booking.assignedStaffEmail = pickupStaff.email;
+    } else {
+      problems.push(`No ${spec} staff available for pickup on ${booking.date} at ${booking.time}.`);
+    }
+
+    if (deliveryStaff) {
+      booking.deliveryStaffId    = deliveryStaff._id;
+      booking.deliveryStaffName  = deliveryStaff.name;
+      booking.deliveryStaffEmail = deliveryStaff.email;
+    } else {
+      problems.push(`No ${spec} staff available for delivery on ${booking.deliveryDate} at ${booking.deliveryTime}.`);
+    }
+
+    if (problems.length > 0) {
+      booking.needsAdminAttention     = true;
+      booking.adminNotificationReason = problems.join(' ');
+    } else {
+      booking.needsAdminAttention     = false;
+      booking.adminNotificationReason = '';
+      booking.laundryStatus = 'booking-confirmed';
+      booking.status        = 'confirmed';
+    }
+
+    await booking.save();
+  } catch (err) {
+    console.error('autoAssignLaundryBooking error:', err);
+  }
+};
+
 // ─── POST /api/bookings ───────────────────────────────────────────────────────
 const createBooking = async (req, res) => {
   try {
     const data = req.body;
+    // Laundry: pickup date/time is the booking's normal date/time (same as
+    // every other service); delivery is a second, independent slot —
+    // auto-calculated 2 working days after pickup and always recomputed
+    // server-side (never trusted from the client) so it can't be spoofed.
+    const isLaundry = isLaundryBooking(data) && !!(data.date && data.time);
+
+    if (isLaundry) {
+      data.deliveryDate = addWorkingDays(data.date, 2);
+      if (!data.deliveryTime || !TIME_SLOTS.includes(data.deliveryTime)) {
+        return res.status(400).json({ success: false, message: 'Please select a valid delivery time slot.' });
+      }
+    }
 
     if (data.date && data.time) {
       // Staff-availability check, not a fixed booking-count limit — a slot
@@ -225,6 +330,16 @@ const createBooking = async (req, res) => {
       }
     }
 
+    if (isLaundry) {
+      const { available } = await getSlotStaffAvailability(data.deliveryDate, data.deliveryTime, data);
+      if (!available) {
+        return res.status(400).json({
+          success: false,
+          message: 'No staff are available for that delivery time slot. Please choose a different delivery time.',
+        });
+      }
+    }
+
     const booking = await Booking.create({
       ...data,
       customerId:    req.user._id,
@@ -232,7 +347,11 @@ const createBooking = async (req, res) => {
       customerEmail: req.user.email,
     });
 
-    await autoAssignBooking(booking);
+    if (isLaundry) {
+      await autoAssignLaundryBooking(booking);
+    } else {
+      await autoAssignBooking(booking);
+    }
 
     res.status(201).json({ success: true, booking });
   } catch (err) {
@@ -260,6 +379,7 @@ const getAssignedBookings = async (req, res) => {
     const raw = await Booking.find({
       $or: [
         { assignedStaffId:        req.user._id },
+        { deliveryStaffId:        req.user._id }, // laundry: delivery leg can be a different staff member
         { 'assignedTeam.staffId': req.user._id },
       ],
       status: { $ne: 'cancelled' },
@@ -289,6 +409,13 @@ const getAssignedBookings = async (req, res) => {
               staffEmail: m.staffEmail,
             }))
           : [],
+        // Laundry pickup + delivery — present only on laundry bookings.
+        laundryStatus:      b.laundryStatus || undefined,
+        deliveryDate:       b.deliveryDate  || undefined,
+        deliveryTime:       b.deliveryTime  || undefined,
+        deliveryStaffName:  b.deliveryStaffName || undefined,
+        isPickupStaff:      !!(b.assignedStaffId && b.assignedStaffId.toString() === req.user._id.toString()),
+        isDeliveryStaff:    !!(b.deliveryStaffId && b.deliveryStaffId.toString() === req.user._id.toString()),
       };
     });
 
@@ -449,6 +576,74 @@ const completeTask = async (req, res) => {
     res.json({ success: true, booking });
   } catch (err) {
     console.error('completeTask error:', err);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// Simple 5-stage laundry flow — kept in sync with the generic `status`
+// field (see the `laundryStatus` schema comment in models/Booking.js) so
+// every existing status-based view (dashboard stats, filters, loyalty
+// triggers) keeps working without any changes.
+const LAUNDRY_STAGE_ORDER = ['booking-confirmed', 'picked-up', 'in-progress', 'delivered', 'completed'];
+const LAUNDRY_STAGE_TO_STATUS = {
+  'booking-confirmed': 'confirmed',
+  'picked-up':          'in-progress',
+  'in-progress':         'in-progress',
+  'delivered':           'in-progress',
+  'completed':           'completed',
+};
+
+// ─── PATCH /api/bookings/:id/laundry-status ──────────────────────────────────
+// Moves a laundry booking one step forward through Booking Confirmed → Picked
+// Up → In Progress → Delivered → Completed. Either the pickup staff or the
+// delivery staff may advance any stage — they're independently assigned but
+// this keeps the demo/staff workflow simple rather than hard-splitting which
+// side can touch which stage.
+const updateLaundryStatus = async (req, res) => {
+  try {
+    const { stage } = req.body;
+    if (!LAUNDRY_STAGE_ORDER.includes(stage)) {
+      return res.status(400).json({ success: false, message: 'Invalid laundry stage.' });
+    }
+
+    const booking = await Booking.findOne({
+      _id: req.params.id,
+      $or: [
+        { assignedStaffId:        req.user._id },
+        { deliveryStaffId:        req.user._id },
+        { 'assignedTeam.staffId': req.user._id },
+      ],
+    });
+    if (!booking) return res.status(404).json({ success: false, message: 'Task not found.' });
+
+    const currentIdx = LAUNDRY_STAGE_ORDER.indexOf(booking.laundryStatus || 'booking-confirmed');
+    const nextIdx     = LAUNDRY_STAGE_ORDER.indexOf(stage);
+    if (nextIdx !== currentIdx + 1) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot move from "${booking.laundryStatus || 'booking-confirmed'}" to "${stage}" directly.`,
+      });
+    }
+
+    booking.laundryStatus = stage;
+    booking.status        = LAUNDRY_STAGE_TO_STATUS[stage];
+    if (stage === 'picked-up') booking.taskStartedAt      = new Date();
+    if (stage === 'delivered') booking.deliveryCompletedAt = new Date();
+    if (stage === 'completed') booking.taskCompletedAt     = new Date();
+    await booking.save();
+
+    if (stage === 'completed') {
+      // Non-fatal if it fails — mirrors markCashReceived's pattern above.
+      try {
+        await awardPointsForBooking(booking.customerId, booking.paidAmount || booking.price, booking._id, booking.bookingId);
+      } catch (loyaltyErr) {
+        console.error('awardPointsForBooking (laundry completed) error:', loyaltyErr);
+      }
+    }
+
+    res.json({ success: true, booking });
+  } catch (err) {
+    console.error('updateLaundryStatus error:', err);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
@@ -620,7 +815,7 @@ const getAllBookings = async (req, res) => {
   try {
     const bookings = await Booking.find({})
       .sort({ createdAt: -1 })
-      .select('bookingId customerName customerEmail serviceName serviceCategory date time status price assignedStaffName assignedTeam needsAdminAttention adminNotificationReason cancellationReason cancelledAt minutesBeforeService');
+      .select('bookingId customerName customerEmail serviceName serviceCategory date time status price assignedStaffName assignedTeam needsAdminAttention adminNotificationReason cancellationReason cancelledAt minutesBeforeService laundryStatus deliveryDate deliveryTime deliveryStaffName');
     res.json({ success: true, bookings });
   } catch (err) {
     console.error('getAllBookings error:', err);
@@ -981,6 +1176,7 @@ module.exports = {
   cancelBooking,
   startTask,
   completeTask,
+  updateLaundryStatus,
   markCashReceived,
   declineTask,
   applyTaskDecline,
