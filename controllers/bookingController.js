@@ -393,6 +393,17 @@ const getAssignedBookings = async (req, res) => {
       status: { $ne: 'cancelled' },
     }).sort({ date: 1, time: 1 });
 
+    // Which of these bookings already have a pending decline request from
+    // this staff member — so the UI can show "Awaiting Approval" instead of
+    // an active Decline Task button that would just get rejected as a
+    // duplicate (and, before this, silently reverted to normal on refresh).
+    const pendingDeclines = await TaskDeclineRequest.find({
+      bookingId: { $in: raw.map(b => b._id) },
+      staffId:   req.user._id,
+      status:    'pending',
+    }).select('bookingId');
+    const pendingDeclineIds = new Set(pendingDeclines.map(d => d.bookingId.toString()));
+
     const bookings = raw.map(b => {
       const hasTeam = b.assignedTeam && b.assignedTeam.length > 0;
       return {
@@ -424,6 +435,7 @@ const getAssignedBookings = async (req, res) => {
         deliveryStaffName:  b.deliveryStaffName || undefined,
         isPickupStaff:      !!(b.assignedStaffId && b.assignedStaffId.toString() === req.user._id.toString()),
         isDeliveryStaff:    !!(b.deliveryStaffId && b.deliveryStaffId.toString() === req.user._id.toString()),
+        hasPendingDecline:  pendingDeclineIds.has(b._id.toString()),
       };
     });
 
