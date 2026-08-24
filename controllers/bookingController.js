@@ -139,19 +139,21 @@ const getBusyStaffIds = async (date, time, excludeBookingId = null) => {
   return busy;
 };
 
-// Whether `serviceInfo` describes the core Laundry service specifically —
-// the only one with the separate pickup+delivery scheduling UI.
-// FIX: this used to also check serviceType/serviceCategory, but Dry
-// Cleaning / Washing & Pressing / Pressing Only all share the generic
-// serviceType "Laundry" (the family label, not the specific service) —
-// matching on that made createBooking demand a deliveryTime for those
-// services too, even though their form never collects one, so submitting
-// them always failed with "Please select a valid delivery time slot."
-// serviceName is the one field that's actually specific: 'laundry' only for
-// this service — 'dry cleaning'/'washing pressing'/'pressing only' for the
-// others (see serviceMapping in Booking.tsx).
-const isLaundryBooking = (serviceInfo = {}) =>
-  (serviceInfo.serviceName || '').toLowerCase().trim() === 'laundry';
+// Whether `serviceInfo` actually has a pickup+delivery flow to schedule.
+// The core Laundry service always does. Dry Cleaning / Washing & Pressing /
+// Pressing Only only do when the customer switched on "Free Pickup &
+// Delivery" (laundryPickupDelivery) — otherwise it's a plain drop-off order
+// with no delivery leg at all.
+// Matches on serviceName specifically, not serviceType/serviceCategory —
+// all four of these services share the generic serviceType "Laundry" (the
+// family label), so matching on that would treat every laundry-family
+// booking as needing delivery scheduling regardless of the toggle.
+const LAUNDRY_FAMILY_OPT_IN_SERVICES = ['dry cleaning', 'washing pressing', 'pressing only'];
+const isLaundryBooking = (serviceInfo = {}) => {
+  const name = (serviceInfo.serviceName || '').toLowerCase().trim();
+  if (name === 'laundry') return true;
+  return LAUNDRY_FAMILY_OPT_IN_SERVICES.includes(name) && !!serviceInfo.laundryPickupDelivery;
+};
 
 // Whether a given date+time slot has enough qualified, unbooked staff to
 // actually staff `serviceInfo` (an object with serviceName/serviceType/
