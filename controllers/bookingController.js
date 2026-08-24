@@ -139,13 +139,19 @@ const getBusyStaffIds = async (date, time, excludeBookingId = null) => {
   return busy;
 };
 
-// Whether `serviceInfo` (serviceName/serviceType/serviceCategory) describes
-// the core Laundry service — the only one with a real pickup+delivery flow.
-const isLaundryBooking = (serviceInfo = {}) => {
-  const text = [serviceInfo.serviceName, serviceInfo.serviceType, serviceInfo.serviceCategory]
-    .filter(Boolean).join(' ').toLowerCase();
-  return text.includes('laundry');
-};
+// Whether `serviceInfo` describes the core Laundry service specifically —
+// the only one with the separate pickup+delivery scheduling UI.
+// FIX: this used to also check serviceType/serviceCategory, but Dry
+// Cleaning / Washing & Pressing / Pressing Only all share the generic
+// serviceType "Laundry" (the family label, not the specific service) —
+// matching on that made createBooking demand a deliveryTime for those
+// services too, even though their form never collects one, so submitting
+// them always failed with "Please select a valid delivery time slot."
+// serviceName is the one field that's actually specific: 'laundry' only for
+// this service — 'dry cleaning'/'washing pressing'/'pressing only' for the
+// others (see serviceMapping in Booking.tsx).
+const isLaundryBooking = (serviceInfo = {}) =>
+  (serviceInfo.serviceName || '').toLowerCase().trim() === 'laundry';
 
 // Whether a given date+time slot has enough qualified, unbooked staff to
 // actually staff `serviceInfo` (an object with serviceName/serviceType/
