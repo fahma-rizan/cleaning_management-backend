@@ -1,0 +1,33 @@
+{
+  "name": "cloud-laundry-backend",
+  "version": "1.0.0",
+  "description": "Cloud Laundry Services - Node.js Express + MongoDB Backend",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "seed": "node src/config/seed.js",
+    "seed:prices": "node src/config/seedPriceList.js",
+    "test": "jest --testEnvironment node"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.117.1",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-validator": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^9.7.0",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0",
+    "nodemon": "^3.1.2",
+    "supertest": "^7.2.2"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testTimeout": 30000
+  }
+}

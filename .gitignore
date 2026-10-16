@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Environment variables (keep your secrets safe!)
+.env
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Runtime data
+pids/
+*.pid
+
+# Build output
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
