@@ -1,4 +1,6 @@
 const User = require('../models/User');
+const { createOnboardedUser } = require('../services/userOnboardingService');
+const { isValidEmail, isValidPhone, EMAIL_RULE, PHONE_RULE } = require('../validators/authValidators');
 
 const toAdminUser = (u) => ({
   _id:          u._id,
@@ -38,29 +40,32 @@ const getAdminById = async (req, res) => {
 };
 
 // ─── POST /api/admins ───────────────────────────────────────────────────────────
+// Password is never taken from the request — createOnboardedUser generates a
+// secure random one server-side, emails it, and flags the account to force a
+// real password on first login. Same shared function Staff Management uses.
 const createAdmin = async (req, res) => {
   try {
-    const { name, email, password, phone, address, role } = req.body;
-    if (!name || !email || !password || !role) {
-      return res.status(400).json({ error: 'Name, email, password and role are required.' });
+    const { name, email, phone, address, role } = req.body;
+    if (!name || !email || !role) {
+      return res.status(400).json({ error: 'Name, email and role are required.' });
     }
+    if (!isValidEmail(email)) return res.status(400).json({ error: EMAIL_RULE });
+    if (phone && !isValidPhone(phone)) return res.status(400).json({ error: PHONE_RULE });
 
     const existing = await User.findOne({ email: email.toLowerCase() });
     if (existing) return res.status(400).json({ error: 'An account with this email already exists.' });
 
     const nameParts = name.trim().split(' ');
-    const admin = await User.create({
+    const admin = await createOnboardedUser({
       firstName: nameParts[0],
       lastName:  nameParts.slice(1).join(' ') || nameParts[0],
       name:      name.trim(),
       email:     email.toLowerCase(),
-      password,
       phone:     phone   || '',
       address:   address || '',
       role:      'admin',
       adminRole: role,
-      isVerified: true,
-    });
+    }, { portalLabel: 'Admin' });
 
     res.status(201).json(toAdminUser(admin));
   } catch (err) {

@@ -20,6 +20,11 @@ const timeField = z
   .refine(val => TIME_SLOTS.includes(val), `time must be one of: ${TIME_SLOTS.join(', ')}`);
 
 // POST /api/bookings
+// The consumption-factor fields (squareFeet/sofaSeatingCapacity/curtainQuantity/
+// mattressSize/mattressCleaningLevel) are only required for the specific
+// service being booked — that's service-dependent, so it's enforced in
+// createBooking (via the service's consumptionrates.unitBasis) rather than
+// here; at the schema level they're all optional.
 const createBookingSchema = z.object({
   date:            dateField,
   time:            timeField,
@@ -28,6 +33,13 @@ const createBookingSchema = z.object({
   paymentMethod:   z.string().min(1, 'paymentMethod is required'),
   serviceName:     z.string().min(1).optional(),
   serviceCategory: z.string().min(1).optional(),
+  serviceId:       z.coerce.number().optional(),
+  cleaningType:    z.string().optional(),
+  squareFeet:          z.coerce.number().optional(),
+  sofaSeatingCapacity: z.coerce.number().optional(),
+  curtainQuantity:     z.coerce.number().optional(),
+  mattressSize:          z.enum(['Single', 'Double', 'Queen', 'King']).optional(),
+  mattressCleaningLevel: z.enum(['Full', 'Top Only']).optional(),
 }).refine(
   data => data.serviceName || data.serviceCategory,
   { message: 'serviceName or serviceCategory is required', path: ['serviceName'] }

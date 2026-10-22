@@ -1,14 +1,22 @@
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
 const sendEmail = require('../utils/sendEmail');
+const {
+  isValidPassword, PASSWORD_RULE,
+  isValidPhone, PHONE_RULE,
+  isValidEmail, EMAIL_RULE,
+  generateTempPassword,
+} = require('../validators/authValidators');
 
-// ─── Validation rules (ported from feature/auth-loyalty-inventory-backend) ────
-// Sri Lankan mobile numbers in +94 international format.
-const PHONE_REGEX = /^\+94(70|71|72|74|75|76|77|78)\d{7}$/;
-const PHONE_RULE  = 'Enter a valid Sri Lankan phone number (e.g. +94771234567).';
-// min 8 chars, at least 1 lowercase, 1 uppercase, 1 number, 1 special character.
-const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
-const PASSWORD_RULE  = 'Minimum 8 characters with uppercase, lowercase, number and special character.';
+// clientSecret + redirectUri are only used for the `code` exchange path below
+// (accounts.oauth2.initCodeClient's popup fallback) — verifyIdToken (the
+// `credential`/One Tap path) ignores them.
+const googleClient = new OAuth2Client({
+  clientId:     process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  redirectUri:  'postmessage', // required by Google for the JS popup code flow — no real redirect happens
+});
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -45,10 +53,13 @@ const register = async (req, res) => {
     if (!firstName || !lastName || !email || !phone || !password) {
       return res.status(400).json({ success: false, message: 'All fields are required.' });
     }
-    if (!PHONE_REGEX.test(phone)) {
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, message: EMAIL_RULE });
+    }
+    if (!isValidPhone(phone)) {
       return res.status(400).json({ success: false, message: PHONE_RULE });
     }
-    if (!PASSWORD_REGEX.test(password)) {
+    if (!isValidPassword(password)) {
       return res.status(400).json({ success: false, message: PASSWORD_RULE });
     }
 
@@ -103,7 +114,7 @@ const register = async (req, res) => {
       otp,
       otpExpiry: new Date(Date.now() + 10 * 60 * 1000),
       loyaltyPoints: 0,
-      badge: 'Silver',
+      badge: 'Bronze',
     });
 
     console.log(`\n📌 OTP for ${email}: ${otp}\n`);
@@ -216,6 +227,8 @@ const login = async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
+        phone: user.phone,
+        address: user.address,
         role: user.role,
         adminRole: user.adminRole,
         isVerified: user.isVerified,
@@ -226,6 +239,99 @@ const login = async (req, res) => {
     });
   } catch (err) {
     console.error('Login error:', err);
+    res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+  }
+};
+
+// POST /api/auth/google
+// Body: { credential } — the ID token Google Identity Services hands back to
+// the frontend on sign-in. Verified server-side against GOOGLE_CLIENT_ID
+// (google-auth-library), never trusted as-is. Stateless — no passport/session
+// machinery, matching the rest of this API's plain-JWT design.
+//
+// Existing account with this email → signs them in (their normal role/flags
+// apply). No account yet → creates a new customer, already verified (Google
+// already proved the email), with a random password they'll never need
+// (kept only because User.password is a required field; they always sign in
+// via Google, and item 6's policy still applies since it's PASSWORD_REGEX-generated).
+//
+// Body is either { credential } — the ID token from the One Tap prompt — or
+// { code } — an authorization code from the OAuth popup fallback the
+// frontend uses when One Tap is suppressed by Chrome/Google's quiet-period
+// cooldown (see lib/googleAuth.ts). A code is exchanged for its own ID token
+// here, then verified exactly the same way as a directly-supplied credential.
+const googleAuth = async (req, res) => {
+  try {
+    const { credential, code } = req.body;
+    if (!credential && !code) {
+      return res.status(400).json({ success: false, message: 'Missing Google credential.' });
+    }
+    if (!process.env.GOOGLE_CLIENT_ID) {
+      console.error('googleAuth error: GOOGLE_CLIENT_ID is not configured.');
+      return res.status(500).json({ success: false, message: 'Google Sign-In is not configured.' });
+    }
+
+    let payload;
+    try {
+      let idToken = credential;
+      if (!idToken && code) {
+        const { tokens } = await googleClient.getToken(code);
+        idToken = tokens.id_token;
+      }
+      const ticket = await googleClient.verifyIdToken({
+        idToken,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
+    } catch (verifyErr) {
+      console.error('Google token verification failed:', verifyErr.message);
+      return res.status(401).json({ success: false, message: 'Google sign-in verification failed.' });
+    }
+
+    if (!payload?.email || !payload.email_verified) {
+      return res.status(401).json({ success: false, message: 'Google account email is not verified.' });
+    }
+
+    let user = await User.findOne({ email: payload.email.toLowerCase() });
+
+    if (!user) {
+      user = await User.create({
+        firstName: payload.given_name || payload.name || 'Google',
+        lastName:  payload.family_name || 'User',
+        email:     payload.email.toLowerCase(),
+        phone:     '',
+        password:  generateTempPassword(), // never used to log in — Google is the only sign-in path
+        role:      'customer',
+        isVerified: true,
+        loyaltyPoints: 0,
+        badge: 'Bronze',
+      });
+    }
+
+    // A staff/admin account created via the temp-password onboarding flow
+    // could technically share an email with a Google login attempt — don't
+    // let Google sign-in bypass their pending forced password change.
+    const token = generateToken(user._id);
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        address: user.address,
+        role: user.role,
+        adminRole: user.adminRole,
+        isVerified: user.isVerified,
+        loyaltyPoints: user.loyaltyPoints,
+        badge: user.badge,
+        requiresPasswordChange: user.requiresPasswordChange,
+      },
+    });
+  } catch (err) {
+    console.error('googleAuth error:', err);
     res.status(500).json({ success: false, message: 'Server error. Please try again.' });
   }
 };
@@ -251,7 +357,9 @@ const forgotPassword = async (req, res) => {
     user.resetCode = resetCode;
     user.resetCodeExpiry = new Date(Date.now() + 15 * 60 * 1000);
     user.resetCodeVerified = false;
-    await user.save();
+    // Reset fields only — skip full-document validation so legacy/staff
+    // accounts missing firstName/lastName can still reset their password.
+    await user.save({ validateBeforeSave: false });
 
     console.log(`\n📌 Reset code for ${email}: ${resetCode}\n`);
     await sendEmail({
@@ -278,7 +386,7 @@ const verifyResetCode = async (req, res) => {
     if (user.resetCodeExpiry < new Date()) return res.status(400).json({ success: false, message: 'Code has expired. Please request a new one.' });
 
     user.resetCodeVerified = true;
-    await user.save();
+    await user.save({ validateBeforeSave: false });
 
     res.json({ success: true, message: 'Code verified successfully.' });
   } catch (err) {
@@ -292,8 +400,8 @@ const resetPassword = async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    if (!password || password.length < 8) {
-      return res.status(400).json({ success: false, message: 'Password must be at least 8 characters.' });
+    if (!isValidPassword(password)) {
+      return res.status(400).json({ success: false, message: PASSWORD_RULE });
     }
 
     const user = await User.findOne({ email: email.toLowerCase() });
@@ -304,7 +412,7 @@ const resetPassword = async (req, res) => {
     user.resetCode = undefined;
     user.resetCodeExpiry = undefined;
     user.resetCodeVerified = false;
-    await user.save();
+    await user.save({ validateBeforeSave: false });
 
     res.json({ success: true, message: 'Password reset successfully. You can now log in.' });
   } catch (err) {
@@ -331,8 +439,8 @@ const staffChangePassword = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Temporary password is incorrect.' });
     }
 
-    if (newPassword.length < 8) {
-      return res.status(400).json({ success: false, message: 'New password must be at least 8 characters.' });
+    if (!isValidPassword(newPassword)) {
+      return res.status(400).json({ success: false, message: PASSWORD_RULE });
     }
 
     user.password = newPassword;
@@ -359,13 +467,161 @@ const staffChangePassword = async (req, res) => {
   }
 };
 
+// POST /api/auth/change-password  (authenticated — behind `protect`)
+// The general "change my own password" flow — customer dashboard Security
+// settings, and available to any logged-in role. Unlike staffChangePassword
+// (which only runs once, pre-login, against a known temp password), this
+// requires the user's *current* password and works for an already-logged-in
+// session at any time.
+const changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Current and new password are required.' });
+    }
+
+    const user = await User.findById(req.user._id).select('+password');
+    if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
+
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      return res.status(401).json({ success: false, message: 'Current password is incorrect.' });
+    }
+
+    if (!isValidPassword(newPassword)) {
+      return res.status(400).json({ success: false, message: PASSWORD_RULE });
+    }
+    if (newPassword === currentPassword) {
+      return res.status(400).json({ success: false, message: 'New password must be different from your current password.' });
+    }
+
+    user.password = newPassword;
+    user.requiresPasswordChange = false;
+    await user.save();
+
+    res.json({ success: true, message: 'Password changed successfully.' });
+  } catch (err) {
+    console.error('changePassword error:', err);
+    res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+  }
+};
+
+// PUT /api/auth/profile — self-service "My Profile" edit (name/phone/address).
+// req.user comes from the `protect` middleware. Deliberately does NOT accept
+// email changes here — that would need re-verification (isVerified/OTP) to
+// avoid silently repointing the account to an unproven address; out of
+// scope for this endpoint.
+const updateProfile = async (req, res) => {
+  try {
+    const { name, phone, address } = req.body;
+
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
+
+    if (name !== undefined) {
+      const trimmed = String(name).trim().replace(/\s+/g, ' ');
+      if (!trimmed) {
+        return res.status(400).json({ success: false, message: 'Name cannot be empty.' });
+      }
+      const spaceIdx = trimmed.indexOf(' ');
+      user.firstName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+      user.lastName  = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx + 1);
+    }
+
+    if (phone !== undefined) {
+      if (phone && !isValidPhone(phone)) {
+        return res.status(400).json({ success: false, message: PHONE_RULE });
+      }
+      user.phone = phone;
+    }
+
+    if (address !== undefined) {
+      user.address = address;
+    }
+
+    await user.save();
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully!',
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        address: user.address,
+        role: user.role,
+        adminRole: user.adminRole,
+        isVerified: user.isVerified,
+        loyaltyPoints: user.loyaltyPoints,
+        badge: user.badge,
+        requiresPasswordChange: user.requiresPasswordChange,
+      },
+    });
+  } catch (err) {
+    console.error('updateProfile error:', err);
+    res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+  }
+};
+
+// DELETE /api/auth/account — customer self-service "Delete Account".
+// req.user is already established by the `protect` middleware, so this
+// doesn't ask for a password (Google-only sign-ins never set one they'd
+// know) — the frontend instead requires typing "DELETE" to confirm.
+//
+// Rather than a hard delete — which would orphan every Booking/Payment/
+// Review/Complaint/LoyaltyTransaction referencing this customer and break
+// admin reports/financial records that expect those to exist — this
+// anonymizes personal info and deactivates the account, keeping booking/
+// payment history intact for business records and audit trail.
+const deleteAccount = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
+
+    if (user.role !== 'customer') {
+      return res.status(403).json({ success: false, message: 'Only customer accounts can be deleted here.' });
+    }
+
+    user.firstName    = 'Deleted';
+    user.lastName     = 'User';
+    // Free up the original email for reuse (unique index) — nobody can type
+    // this placeholder to log back in.
+    user.email         = `deleted-${user._id}@deleted.cloudlaundry.lk`;
+    user.phone         = '';
+    user.address       = '';
+    user.profilePhoto  = undefined;
+    user.status        = 'blocked';
+    user.isActive       = false; // also kills any still-valid JWT immediately — see protect() in authMiddleware.js
+    user.deletedAt      = new Date();
+    // Clear any in-flight OTP/reset flows against the old identity.
+    user.otp                = undefined;
+    user.otpExpiry          = undefined;
+    user.resetCode          = undefined;
+    user.resetCodeExpiry    = undefined;
+    user.resetCodeVerified  = false;
+
+    await user.save();
+
+    res.json({ success: true, message: 'Your account has been deleted.' });
+  } catch (err) {
+    console.error('deleteAccount error:', err);
+    res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+  }
+};
+
 module.exports = {
   register,
   verifyOTP,
   resendOTP,
   login,
+  googleAuth,
   forgotPassword,
   verifyResetCode,
   resetPassword,
+  changePassword,
   staffChangePassword,
+  updateProfile,
+  deleteAccount,
 };

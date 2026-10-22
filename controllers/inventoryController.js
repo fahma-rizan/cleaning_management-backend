@@ -2,17 +2,25 @@ const InventoryItem = require('../models/InventoryItem');
 const InventoryTransaction = require('../models/InventoryTransaction');
 
 // ─── GET /api/inventory ─────────────────────────────────────────────────────────
+// This system tracks consumable supplies. A handful of legacy/equipment
+// records exist in the collection (type: 'equipment') but the Admin
+// Inventory tab is consumables-only, so they're excluded by default.
+// Pass includeEquipment=true to opt back in (not used by the consumables UI).
 const getItems = async (req, res) => {
   try {
-    const { search, type } = req.query;
+    const { search, type, includeEquipment } = req.query;
     const filter = {};
+
+    if (includeEquipment !== 'true') {
+      filter.type = { $ne: 'equipment' };
+    }
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: 'i' } },
         { sku:  { $regex: search, $options: 'i' } },
       ];
     }
-    if (type) filter.type = type;
+    if (type) filter.type = type; // exact match on a specific type narrows further
 
     const items = await InventoryItem.find(filter).sort({ name: 1 });
     res.json({ items, pagination: { total: items.length } });
@@ -118,6 +126,10 @@ const adjustStock = async (req, res) => {
     else if (type === 'deduct')                  newQty = Math.max(0, previousQty - qty);
     else if (type === 'adjustment')               newQty = qty;
     else return res.status(400).json({ error: 'Invalid adjustment type' });
+
+    // Round to avoid IEEE754 noise (e.g. 24.3 + 0.1 = 24.399999999999999)
+    // accumulating in the stored value across repeated adjustments.
+    newQty = Math.round(newQty * 100) / 100;
 
     item.quantity = newQty;
     await item.save();

@@ -2,6 +2,7 @@ const Booking = require('../models/Booking');
 const User    = require('../models/User');
 const InventoryItem = require('../models/InventoryItem');
 const InventoryTransaction = require('../models/InventoryTransaction');
+const CompletionReport = require('../models/CompletionReport');
 
 const PAYMENT_METHOD_LABELS = {
   cash: 'Cash on Delivery',
@@ -144,50 +145,69 @@ const getCustomersReport = async (req, res) => {
 };
 
 // ─── GET /api/reports/monthly?year&month ───────────────────────────────────────
-// Per-item stock movement summary (Inventory > Monthly Report tab).
+// Per-item consumables report (Inventory > Monthly Report tab): every
+// consumable item, with its actual verified consumption and actual restock
+// quantity for the selected month — including items with zero activity.
+//
+// netConsumed comes from verified CompletionReports (items[].qtyActualVerified,
+// matched by sku, filtered by verifiedAt) — NOT InventoryTransaction 'deduct'
+// records. confirmMaterialRequest/verifyCompletionReport/handleBookingCancellation
+// (services/materialRequestService.js, services/completionReportService.js)
+// adjust InventoryItem.quantity directly and never write an InventoryTransaction
+// row; that log only ever captures manual admin adjustments via adjustStock()
+// in inventoryController.js. Allocation (qtyRequested at confirm time) and a
+// staff's as-submitted usage (qtyActualReported) are both deliberately excluded
+// — only the admin-verified figure counts as real consumption, and a report can
+// only ever be verified once (unique bookingId, no reopen/reverify), so there's
+// no double-counting risk.
+//
+// restocked comes from InventoryTransaction where type: 'restock' — the only
+// thing that ever creates those rows is adjustStock's 'restock' branch (the
+// Consumables tab's Restock action). Initial/seeded stock is never logged as
+// a 'restock' transaction (seed.js sets InventoryItem.quantity directly), so
+// it's correctly excluded with no special-casing.
+//
+// Equipment (InventoryItem.type === 'equipment') is excluded entirely.
 const getMonthlyInventoryReport = async (req, res) => {
   try {
     const year  = Number(req.query.year)  || new Date().getFullYear();
     const month = Number(req.query.month) || (new Date().getMonth() + 1); // 1-12
 
+    // Half-open range in server-local time — new Date(y, m, d) uses local
+    // timezone components directly, unlike new Date('YYYY-MM-DD') (which
+    // parses as UTC midnight and can silently drop end-of-month records).
     const start = new Date(year, month - 1, 1);
     const end   = new Date(year, month, 1);
 
-    const transactions = await InventoryTransaction.find({ createdAt: { $gte: start, $lt: end } });
-    const items = await InventoryItem.find();
-    const itemMap = Object.fromEntries(items.map(i => [String(i._id), i]));
+    const consumables = await InventoryItem.find({ type: { $ne: 'equipment' } }).lean();
 
-    const byItem = {};
-    for (const t of transactions) {
-      const key = String(t.itemId);
-      if (!byItem[key]) byItem[key] = { deducted: 0, returned: 0, restocked: 0, transactionCount: 0 };
-      byItem[key].transactionCount += 1;
-      if (t.type === 'deduct')          byItem[key].deducted  += t.quantity;
-      else if (t.type === 'return')     byItem[key].returned  += t.quantity;
-      else if (t.type === 'restock')    byItem[key].restocked += t.quantity;
+    const [verifiedReports, restockTxns] = await Promise.all([
+      CompletionReport.find({ status: 'verified', verifiedAt: { $gte: start, $lt: end } }).select('items').lean(),
+      InventoryTransaction.find({ type: 'restock', createdAt: { $gte: start, $lt: end } }).select('itemId quantity').lean(),
+    ]);
+
+    const consumedBySku = {};
+    for (const report of verifiedReports) {
+      for (const item of report.items) {
+        consumedBySku[item.sku] = (consumedBySku[item.sku] || 0) + item.qtyActualVerified;
+      }
     }
 
-    const perItem = Object.entries(byItem).map(([itemId, stats]) => {
-      const item = itemMap[itemId] || {};
-      return {
-        name: item.name, sku: item.sku, type: item.type,
-        deducted: stats.deducted, returned: stats.returned,
-        netConsumed: Math.max(0, stats.deducted - stats.returned),
-        restocked: stats.restocked, transactionCount: stats.transactionCount,
-      };
-    });
+    const restockedByItemId = {};
+    for (const t of restockTxns) {
+      const key = String(t.itemId);
+      restockedByItemId[key] = (restockedByItemId[key] || 0) + t.quantity;
+    }
 
-    const summary = perItem.reduce(
-      (acc, r) => ({
-        totalDeducted: acc.totalDeducted + r.deducted,
-        totalReturned: acc.totalReturned + r.returned,
-        netConsumed:   acc.netConsumed   + r.netConsumed,
-        totalRestocked: acc.totalRestocked + r.restocked,
-      }),
-      { totalDeducted: 0, totalReturned: 0, netConsumed: 0, totalRestocked: 0 }
-    );
+    const items = consumables.map(item => ({
+      name: item.name,
+      sku:  item.sku,
+      type: item.type,
+      netConsumed: Math.round((consumedBySku[item.sku] || 0) * 100) / 100,
+      restocked:   Math.round((restockedByItemId[String(item._id)] || 0) * 100) / 100,
+    }));
 
-    res.json({ year, month, summary, items: perItem });
+    res.json({ year, month, items });
   } catch (err) {
     console.error('getMonthlyInventoryReport error:', err);
     res.status(500).json({ error: 'Failed to generate monthly inventory report' });
@@ -232,7 +252,106 @@ const getAnomalySummary = async (req, res) => {
   }
 };
 
+// 'YYYY-MM-DD' → local calendar-day Date, same reasoning as getTodayLocalStr
+// in utils/dateUtils.js: `new Date('YYYY-MM-DD')` parses as UTC midnight, not
+// local midnight, which silently mis-buckets records near a day boundary.
+// Building the Date from explicit y/m/d components uses the server's local
+// timezone instead. Also rejects calendar-invalid dates (e.g. 2026-02-30),
+// which the Date constructor would otherwise silently roll into March.
+const parseLocalDateStrict = (str) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str || '');
+  if (!m) return null;
+  const [, y, mo, d] = m.map(Number);
+  const date = new Date(y, mo - 1, d);
+  if (date.getFullYear() !== y || date.getMonth() !== mo - 1 || date.getDate() !== d) return null;
+  return date;
+};
+
+// ─── GET /api/reports/inventory-range?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD ──
+// Date-range consumables report: totalConsumed and totalRestocked.
+//
+// totalConsumed comes from verified CompletionReports (items[].qtyActualVerified,
+// filtered by verifiedAt) — NOT from InventoryTransaction 'deduct' records,
+// because confirmMaterialRequest/verifyCompletionReport/handleBookingCancellation
+// (services/materialRequestService.js, services/completionReportService.js)
+// adjust InventoryItem.quantity directly and never write an InventoryTransaction
+// row; that log only ever captures manual admin adjustments via adjustStock()
+// in inventoryController.js. Using 'deduct' transactions here would silently
+// miss almost all real consumption under the current booking→material-request→
+// completion-report flow, and would report allocation (qtyRequested at confirm
+// time) rather than actual verified usage — exactly what this report must avoid.
+//
+// totalRestocked comes from InventoryTransaction where type: 'restock' — the
+// only thing that ever creates those rows is adjustStock's 'restock' branch
+// (the Admin Inventory tab's Restock action), so this is a complete, accurate
+// source with no double-counting risk. Initial/seeded stock is never logged
+// as a 'restock' transaction (seed.js sets InventoryItem.quantity directly),
+// so it's correctly excluded without any special-casing.
+//
+// Both totals exclude equipment (InventoryItem.type === 'equipment') — the
+// consumables-only rule already established for the rest of Inventory
+// Management (Consumables tab, Material Requests, etc.).
+const getInventoryRangeReport = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    if (!startDate) return res.status(400).json({ error: 'startDate is required' });
+    if (!endDate)   return res.status(400).json({ error: 'endDate is required' });
+
+    const start = parseLocalDateStrict(startDate);
+    const end   = parseLocalDateStrict(endDate);
+    if (!start || !end) {
+      return res.status(400).json({ error: 'startDate and endDate must be valid dates in YYYY-MM-DD format' });
+    }
+    if (end < start) {
+      return res.status(400).json({ error: 'endDate cannot be earlier than startDate' });
+    }
+
+    // Half-open range so the entire end calendar day is included regardless
+    // of what time of day records were created — matches getMonthlyInventoryReport's
+    // $gte/$lt convention just above.
+    const rangeStart = start;
+    const rangeEnd   = new Date(end.getFullYear(), end.getMonth(), end.getDate() + 1);
+
+    const invItems = await InventoryItem.find().select('sku type').lean();
+    const consumableSkus    = new Set(invItems.filter(i => i.type !== 'equipment').map(i => i.sku));
+    const consumableItemIds = new Set(invItems.filter(i => i.type !== 'equipment').map(i => String(i._id)));
+
+    // ── Total Consumed — final verified usage only ──────────────────────────
+    const verifiedReports = await CompletionReport.find({
+      status: 'verified',
+      verifiedAt: { $gte: rangeStart, $lt: rangeEnd },
+    }).select('items').lean();
+
+    let totalConsumed = 0;
+    for (const report of verifiedReports) {
+      for (const item of report.items) {
+        if (consumableSkus.has(item.sku)) totalConsumed += item.qtyActualVerified;
+      }
+    }
+
+    // ── Total Restocked — actual restock transactions only ──────────────────
+    const restockTxns = await InventoryTransaction.find({
+      type: 'restock',
+      createdAt: { $gte: rangeStart, $lt: rangeEnd },
+    }).select('itemId quantity').lean();
+
+    const totalRestocked = restockTxns
+      .filter(t => consumableItemIds.has(String(t.itemId)))
+      .reduce((sum, t) => sum + t.quantity, 0);
+
+    res.json({
+      startDate,
+      endDate,
+      totalConsumed:  Math.round(totalConsumed * 100) / 100,
+      totalRestocked: Math.round(totalRestocked * 100) / 100,
+    });
+  } catch (err) {
+    console.error('getInventoryRangeReport error:', err);
+    res.status(500).json({ error: 'Failed to generate inventory range report' });
+  }
+};
+
 module.exports = {
   getBookingsReport, getPaymentsReport, getStaffPerformanceReport, getCustomersReport,
-  getMonthlyInventoryReport, getAnomalySummary,
+  getMonthlyInventoryReport, getAnomalySummary, getInventoryRangeReport,
 };

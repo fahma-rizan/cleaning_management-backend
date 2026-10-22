@@ -2,6 +2,8 @@ const crypto  = require('crypto');
 const Booking = require('../models/Booking');
 const Invoice = require('../models/Invoice');
 const User    = require('../models/User');
+const Payment = require('../models/Payment');
+const { processSuccessfulPayment, withPaymentRetry } = require('./loyaltyController');
 
 const md5 = (str) => crypto.createHash('md5').update(str).digest('hex').toUpperCase();
 
@@ -110,7 +112,7 @@ const notify = async (req, res) => {
   try {
     const {
       merchant_id, order_id, payhere_amount, payhere_currency,
-      status_code, md5sig,
+      status_code, md5sig, payment_id,
     } = req.body;
 
     const merchantSecret = process.env.PAYHERE_MERCHANT_SECRET;
@@ -125,20 +127,65 @@ const notify = async (req, res) => {
     if (String(status_code) === '2') { // 2 = success
       const booking = await Booking.findOne({ bookingId: order_id });
       if (booking) {
-        const paid = parseFloat(payhere_amount);
-        booking.paidAmount    = (booking.paidAmount || 0) + paid;
-        booking.balanceAmount = Math.max(0, booking.price - booking.paidAmount);
-        booking.paymentStatus = booking.balanceAmount === 0 ? 'paid' : 'partial';
-        booking.status        = 'confirmed';
-        await booking.save();
+        // PayHere retries IPN delivery until it gets a 200 — payment_id is
+        // PayHere's own transaction reference, so a retry for a payment
+        // already recorded is detected here and skipped rather than
+        // double-counting the money or double-awarding points.
+        const gatewayId = payment_id ? String(payment_id) : undefined;
+        let payment = gatewayId ? await Payment.findOne({ gatewayId }) : null;
 
-        const invoice = await Invoice.findOne({ bookingId: order_id }).sort({ createdAt: -1 });
-        if (invoice) {
-          invoice.paidAmount    = booking.paidAmount;
-          invoice.balanceAmount = booking.balanceAmount;
-          invoice.status        = booking.balanceAmount === 0 ? 'PAID' : 'PARTIAL';
-          await invoice.save();
-          req.app.get('io')?.emit('invoiceUpdate', invoice);
+        if (!payment) {
+          const paid = parseFloat(payhere_amount);
+          booking.paidAmount    = (booking.paidAmount || 0) + paid;
+          booking.balanceAmount = Math.max(0, booking.price - booking.paidAmount);
+          booking.paymentStatus = booking.balanceAmount === 0 ? 'paid' : 'partial';
+          booking.status        = 'confirmed';
+          await booking.save();
+
+          const invoice = await Invoice.findOne({ bookingId: order_id }).sort({ createdAt: -1 });
+          if (invoice) {
+            invoice.paidAmount    = booking.paidAmount;
+            invoice.balanceAmount = booking.balanceAmount;
+            invoice.status        = booking.balanceAmount === 0 ? 'PAID' : 'PARTIAL';
+            await invoice.save();
+            req.app.get('io')?.emit('invoiceUpdate', invoice);
+          }
+
+          // Retries just this insert on a transient blip — a genuine retry
+          // of the *whole* function is already covered by PayHere resending
+          // the IPN until it gets a 200, so this only needs to survive a
+          // hiccup within a single delivery attempt.
+          payment = await withPaymentRetry(() => Payment.create({
+            bookingId:   booking._id,
+            invoiceId:   invoice?._id,
+            customerId:  booking.customerId,
+            amount:      paid,
+            currency:    payhere_currency,
+            method:      'online',
+            status:      'paid',
+            gatewayId,
+            gatewayResponse: req.body,
+            paidAt:      new Date(),
+            ipnVerified: true,
+          }));
+        }
+
+        // Outside the `if (!payment)` block on purpose: if a *previous*
+        // delivery attempt got as far as creating the Payment record above
+        // but failed before awarding points, PayHere's own retry lands here
+        // with `payment` already found — this still finishes the award
+        // instead of silently never retrying it. processSuccessfulPayment
+        // is idempotent on paymentId, so completing it again for an
+        // already-processed payment is a safe no-op either way.
+        try {
+          await withPaymentRetry(() => processSuccessfulPayment({
+            userId:     booking.customerId,
+            bookingId:  booking._id,
+            paymentId:  payment._id,
+            amountPaid: payment.amount,
+          }));
+        } catch (loyaltyErr) {
+          console.error('processSuccessfulPayment (payhere notify) error:', loyaltyErr);
         }
       }
     }

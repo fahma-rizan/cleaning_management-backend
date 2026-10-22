@@ -351,17 +351,19 @@ const seed = async () => {
   // ── Loyalty demo data for an existing real customer ──────────────────────────
   const loyaltyDemoUser = await User.findOne({ email: 'sathu@gmail.com' });
   if (loyaltyDemoUser && (await LoyaltyTransaction.countDocuments({ userId: loyaltyDemoUser._id })) === 0) {
-    loyaltyDemoUser.lifetimePoints = 1612;
+    // Lifetime points/tier thresholds match constants/loyalty.js (Platinum: 3001+).
+    loyaltyDemoUser.lifetimePoints = 3200;
     loyaltyDemoUser.loyaltyPoints = 862;
     loyaltyDemoUser.badge = 'Platinum';
-    loyaltyDemoUser.tierDiscountsUsed = { Silver: true, Gold: true, Platinum: true };
+    loyaltyDemoUser.tierPerksGranted = { Silver: true, Gold: true, Platinum: true };
+    loyaltyDemoUser.tierPerksUsed = { Silver: true, Gold: true };
     await loyaltyDemoUser.save();
 
     const daysAgo = (n) => new Date(Date.now() - n * 24 * 60 * 60 * 1000);
     const txns = [
       { type: 'earned',   points: 150,  reason: 'Earned for booking payment (full)', createdAt: daysAgo(52) },
       { type: 'redeemed', points: -200, reason: 'Redeemed 200 pts for Rs. 200 discount', createdAt: daysAgo(52) },
-      { type: 'bonus',    points: 0,    reason: 'Tier upgraded from gold to platinum — lifetime points reached 700', createdAt: daysAgo(45) },
+      { type: 'bonus',    points: 0,    reason: 'Tier upgraded from gold to platinum — lifetime points reached 3001', createdAt: daysAgo(45) },
       { type: 'earned',   points: 150,  reason: 'Earned for booking payment (full)', createdAt: daysAgo(45) },
       { type: 'earned',   points: 150,  reason: 'Earned for booking payment (full)', createdAt: daysAgo(38) },
       { type: 'redeemed', points: -150, reason: 'Redeemed 150 pts for Rs. 150 discount', createdAt: daysAgo(38) },
@@ -372,7 +374,7 @@ const seed = async () => {
     for (const t of txns) {
       await LoyaltyTransaction.create({ userId: loyaltyDemoUser._id, ...t });
     }
-    console.log(`✅ Seeded loyalty demo data for ${loyaltyDemoUser.email} (Platinum, 1,612 lifetime pts)`);
+    console.log(`✅ Seeded loyalty demo data for ${loyaltyDemoUser.email} (Platinum, 3,200 lifetime pts)`);
   }
 
   console.log('\n✅ Seeding complete!');

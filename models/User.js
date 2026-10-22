@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const { getTier } = require('../constants/loyalty');
 
 /**
  * MASTER USER MODEL — shared by all roles
@@ -35,22 +36,33 @@ const userSchema = new mongoose.Schema(
     isActive:               { type: Boolean, default: true },
     status:                 { type: String, enum: ['active', 'inactive', 'blocked'], default: 'active' },
     requiresPasswordChange: { type: Boolean, default: false },
+    // Set by the customer self-service "Delete Account" flow (authController.deleteAccount).
+    // Distinct from an admin setting status:'blocked' on a troublesome customer —
+    // this marks a customer-initiated deletion for support/audit purposes.
+    deletedAt:               { type: Date },
 
     // — Loyalty (customers) ———————————————————————————————————————————————————
-    loyaltyPoints:  { type: Number, default: 0 }, // redeemable balance — resets Dec 31 each year
-    lifetimePoints: { type: Number, default: 0 }, // never resets — determines tier permanently
+    loyaltyPoints:  { type: Number, default: 0, min: 0 }, // spendable currentBalance — can never go negative; resets Dec 31 each year
+    lifetimePoints: { type: Number, default: 0 }, // never resets by expiry — determines tier permanently; only earning/reversal change it
+    // Points still owed back because a reversal exceeded currentBalance at the
+    // time (i.e. the points being clawed back had already been redeemed).
+    // Future earned points repay this before adding to currentBalance, and no
+    // redemption is allowed while it's > 0. See loyaltyController.js.
+    loyaltyDebt: { type: Number, default: 0, min: 0 },
     badge: {
       type: String,
       enum: ['Bronze', 'Silver', 'Gold', 'Platinum'],
     },
-    // One-time discount reward per tier, e.g. { Silver: true, Gold: false, ... } once used
-    tierDiscountsUsed: { type: mongoose.Schema.Types.Mixed, default: {} },
-    // A reserved-but-not-yet-applied tier discount, consumed by the next booking
-    pendingTierDiscount: {
-      tier:     { type: String },
-      percent:  { type: Number },
-      reservedAt: { type: Date },
-    },
+    // Permanent, one-time-ever record of which tier perks this customer has
+    // been GRANTED (i.e. has ever reached that tier) — never cleared, even if
+    // the customer later drops back down a tier. e.g. { Silver: true, Gold: true }
+    tierPerksGranted: { type: mongoose.Schema.Types.Mixed, default: {} },
+    // Whether a granted perk has actually been applied as a discount yet —
+    // separate from "granted" so a perk earned but not yet spent stays usable.
+    tierPerksUsed: { type: mongoose.Schema.Types.Mixed, default: {} },
+    // Which calendar year currentBalance was last zeroed for (annual expiry) —
+    // prevents the Dec 31 cron / admin reset from double-expiring the same year.
+    loyaltyLastExpiryYear: { type: Number },
 
     // — Staff-specific ————————————————————————————————————————————————————————
     specializations: [{ type: String }], // e.g. ['Home Cleaning', 'Laundry']
@@ -110,13 +122,11 @@ userSchema.methods.comparePassword = async function (plain) {
 };
 
 // — Auto-assign badge based on loyalty points ——————————————————————————————————
-// Tier thresholds are based on LIFETIME points (never reset) — keep in sync with
-// the frontend's src/app/lib/loyaltyTiers.ts TIERS definition.
+// Tier thresholds live in constants/loyalty.js — the single source of truth
+// (this used to hardcode its own copy of the same thresholds, which had
+// drifted out of sync with loyaltyController.js's copy during a merge).
 userSchema.methods.updateBadge = function () {
-  if      (this.lifetimePoints >= 700) this.badge = 'Platinum';
-  else if (this.lifetimePoints >= 300) this.badge = 'Gold';
-  else if (this.lifetimePoints >= 100) this.badge = 'Silver';
-  else                                   this.badge = 'Bronze';
+  this.badge = getTier(this.lifetimePoints).name;
 };
 
 module.exports = mongoose.model('User', userSchema);
