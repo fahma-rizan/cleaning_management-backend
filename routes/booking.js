@@ -238,12 +238,30 @@ router.post('/', async (req, res, next) => {
       });
     }
 
+    let resolvedCustomerId = customerId;
+    if (!mongoose.Types.ObjectId.isValid(resolvedCustomerId)) {
+      if (process.env.NODE_ENV !== 'development') {
+        return res.status(400).json({ msg: 'A valid customer account is required.' });
+      }
+      const User = require('../models/User');
+      const demoCustomer = await User.findOne({
+        email: customerEmail || 'seed-temp-customer@local',
+        role: 'customer',
+      });
+      if (!demoCustomer) {
+        return res.status(400).json({
+          msg: 'The local demo customer is not configured. Run backend/seed-one-booking.js or sign in as a customer.',
+        });
+      }
+      resolvedCustomerId = demoCustomer._id;
+    }
+
     const price = (serviceItems && serviceItems.length > 0)
       ? serviceItems.reduce((sum, item) => sum + item.price * (item.quantity || 1), 0)
       : 0;
 
     const newBooking = new Booking({
-      customerId,
+      customerId: resolvedCustomerId,
       customerName,
       customerEmail,
       serviceName,
@@ -270,7 +288,7 @@ router.post('/', async (req, res, next) => {
     // existed but was never auto-triggered by anything.
     try {
       await Notification.create({
-        userId:    customerId,
+        userId:    resolvedCustomerId,
         type:      'order-confirmed',
         title:     'Booking Confirmed',
         message:   `Your booking ${newBooking.bookingId} for ${serviceName} on ${date} at ${time} is confirmed.`,

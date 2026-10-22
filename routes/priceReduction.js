@@ -12,7 +12,7 @@ router.post('/request', auth, ctrl.requestPriceReduction);
 // @route   GET /api/price-reductions
 // @desc    Get all pending price reduction requests (admin)
 // @access  Private
-router.get('/', auth, ctrl.getAllReductions);
+router.get('/', auth, adminOnly, ctrl.getAllReductions);
 
 // @route   GET /api/price-reductions/:id
 // @desc    NEW — fetch a single reduction (used by the customer-facing
@@ -23,12 +23,12 @@ router.get('/:id', auth, ctrl.getReductionById);
 // @route   POST /api/price-reductions/approve/:id
 // @desc    Admin approves a price reduction
 // @access  Private
-router.post('/approve/:id', auth, ctrl.approveReduction);
+router.post('/approve/:id', auth, adminOnly, ctrl.approveReduction);
 
 // @route   POST /api/price-reductions/reject/:id
 // @desc    Admin rejects a price reduction
 // @access  Private
-router.post('/reject/:id', auth, ctrl.rejectReduction);
+router.post('/reject/:id', auth, adminOnly, ctrl.rejectReduction);
 
 // @route   POST /api/price-reductions/:id/bank-details
 // @desc    NEW — customer submits their own bank details for an approved

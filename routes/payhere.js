@@ -239,6 +239,21 @@ router.post('/notify', async (req, res) => {
       date, time, totalPrice, loyaltyPointsUsed, loyaltyDiscount, paidAmount,
     } = draft;
 
+    let resolvedCustomerId = customerId;
+    if (!mongoose.Types.ObjectId.isValid(resolvedCustomerId)) {
+      if (process.env.NODE_ENV !== 'development') {
+        return res.status(400).send('A valid customer account is required');
+      }
+      const demoCustomer = await User.findOne({
+        email: customerEmail || 'seed-temp-customer@local',
+        role: 'customer',
+      });
+      if (!demoCustomer) {
+        return res.status(400).send('Local demo customer is not configured');
+      }
+      resolvedCustomerId = demoCustomer._id;
+    }
+
     const isFullPayment = paymentMethod === 'full-online';
 
     // FIX (see audit): balanceAmount must account for the loyalty discount
@@ -249,7 +264,7 @@ router.post('/notify', async (req, res) => {
 
     const newBooking = new Booking({
       checkoutRef,
-      customerId,
+      customerId: resolvedCustomerId,
       customerName,
       customerEmail,
       serviceName,
@@ -282,7 +297,7 @@ router.post('/notify', async (req, res) => {
       invoiceType: isFullPayment ? 'FULL' : 'ADVANCE',
       bookingId: newBooking._id,
       customer: {
-        userId:  customerId,
+        userId:  resolvedCustomerId,
         name:    customerName || 'Customer',
         email:   customerEmail,
         phone:   customerPhone || 'N/A',
@@ -317,7 +332,7 @@ router.post('/notify', async (req, res) => {
       await recordPayment({
         invoiceId:  invoice._id,
         bookingId:  newBooking._id,
-        customerId,
+        customerId: resolvedCustomerId,
         amount:     paidAmount,
         direction:  'CHARGE',
         method:     'online',

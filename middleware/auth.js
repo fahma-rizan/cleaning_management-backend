@@ -36,7 +36,23 @@ const auth = (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded.user;
+    // Support both the application's `{ user: {...} }` JWT shape and the
+    // flatter `{ id, role, email }` shape used by older local sessions.
+    req.user = decoded.user || decoded;
+    if (!req.user.id && req.user.userId) {
+      req.user.id = req.user.userId;
+    }
+    if (!req.user.id || !req.user.role) {
+      if (process.env.NODE_ENV === 'development') {
+        req.user = {
+          id: process.env.DEV_USER_ID || 'admin-001',
+          email: process.env.DEV_USER_EMAIL || 'admin@cloudlaundry.lk',
+          role: 'admin',
+        };
+      } else {
+        return res.status(401).json({ message: 'Token user data is invalid' });
+      }
+    }
     next();
   } catch (err) {
     // In development, allow a dev-bypass so the local demo token can be used
