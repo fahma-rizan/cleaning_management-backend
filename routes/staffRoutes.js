@@ -1,8 +1,8 @@
 const express = require('express');
 const router  = express.Router();
-const multer  = require('multer');
-const path    = require('path');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
+const { requireRole } = require('../middleware/roleGuard');
+const { upload } = require('../middleware/upload');
 const {
   createStaff,
   toggleAvailability,
@@ -22,14 +22,9 @@ const {
 } = require('../controllers/staffController');
 const { getStaffOverview, getStaffTaskDetails } = require('../controllers/staffRequestController');
 
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: path.join(__dirname, '..', 'uploads', 'staff'),
-    filename: (req, file, cb) => {
-      cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g, '_')}`);
-    },
-  }),
-});
+// Role tiers restored from the old staff.routes.js.
+const ALL_OPS = ['Super Admin', 'Main Admin', 'Operations Manager'];
+const SENIOR  = ['Super Admin', 'Main Admin'];
 
 // ══════════════════════════════════════════════════════════════════════════════
 // IMPORTANT: every literal path below (old and new) must be registered before
@@ -46,21 +41,26 @@ router.get('/reassignments',  protect, adminOnly, getReassignmentData); // admin
 router.get('/me',             protect, getMyProfile);                 // staff
 router.patch('/profile',      protect, updateMyProfile);              // staff
 
-// ─── Admin panel v2 (feature/admin-dashboard) — no auth yet, see note in api.ts ────
-// These are intentionally NOT behind `protect` because the new admin panel's
-// lib/api.ts doesn't send a Bearer token yet ("Temporary mock token until auth
-// finishes"). Tighten this once real admin auth is wired through.
-router.get('/available',      getAvailableStaffV2);
-router.get('/overview',       protect, adminOnly, getStaffOverview); // Staff Task Overview — admin
-router.get('/',                getAllStaffV2);
-router.post('/',               upload.single('photo'), createStaffV2);
+// ─── Admin panel v2 (feature/admin-dashboard) ──────────────────────────────────
+// Locked down to the same role tiers the old backend used for the equivalent
+// staff CRUD endpoints, now that lib/api.ts sends a real Bearer token.
+//
+// Photo upload restored to Cloudinary (middleware/upload.js) — this used to
+// be a plain multer().diskStorage() writing to local disk in
+// backend-new/uploads/staff/, which loses every photo on redeploy. req.file
+// now carries a Cloudinary secure_url instead of a local filename; see the
+// matching change in controllers/staffController.js.
+router.get('/available',      protect, requireRole(...ALL_OPS), getAvailableStaffV2);
+router.get('/overview',       protect, adminOnly,               getStaffOverview); // Staff Task Overview — admin
+router.get('/',                protect, requireRole(...ALL_OPS), getAllStaffV2);
+router.post('/',               protect, requireRole(...SENIOR),  upload.single('photo'), createStaffV2);
 
 // ─── /:id wildcard routes — must stay last ─────────────────────────────────────
-router.get('/:id/tasks',       protect, adminOnly, getStaffTaskDetails); // Staff Task Overview — detail drill-down
-router.get('/:id',             getStaffByIdV2);
-router.put('/:id',             upload.single('photo'), updateStaffV2);
-router.put('/:id/deactivate',  deactivateStaffV2);
-router.put('/:id/activate',    activateStaffV2);
-router.delete('/:id',          deleteStaffV2);
+router.get('/:id/tasks',       protect, adminOnly,               getStaffTaskDetails); // Staff Task Overview — detail drill-down
+router.get('/:id',             protect, requireRole(...ALL_OPS), getStaffByIdV2);
+router.put('/:id',             protect, requireRole(...SENIOR),  upload.single('photo'), updateStaffV2);
+router.put('/:id/deactivate',  protect, requireRole(...SENIOR),  deactivateStaffV2);
+router.put('/:id/activate',    protect, requireRole(...SENIOR),  activateStaffV2);
+router.delete('/:id',          protect, requireRole(...SENIOR),  deleteStaffV2);
 
 module.exports = router;

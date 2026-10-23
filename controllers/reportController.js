@@ -2,6 +2,7 @@ const Booking = require('../models/Booking');
 const User    = require('../models/User');
 const InventoryItem = require('../models/InventoryItem');
 const InventoryTransaction = require('../models/InventoryTransaction');
+const { getStaffRatingStats, getStaffJobCounts } = require('../utils/staffStats');
 
 const PAYMENT_METHOD_LABELS = {
   cash: 'Cash on Delivery',
@@ -85,18 +86,27 @@ const getStaffPerformanceReport = async (req, res) => {
 
     const staffList = await User.find(filter).select('name email rating jobsCompleted isAvailable');
 
-    const withStats = await Promise.all(
-      staffList.map(async (s) => {
-        const completed = await Booking.countDocuments({ assignedStaffId: s._id, status: 'completed' });
-        return {
-          _id:           s._id,
-          name:          s.name,
-          rating:        s.rating || 0,
-          jobsCompleted: completed,
-          status:        s.isAvailable ? 'Active' : 'Inactive',
-        };
-      })
-    );
+    // Same shared aggregations Staff Management uses (staffStats.js), so
+    // this report and that page can't disagree — was previously reading
+    // the stale User.rating field and only counting assignedStaffId (not
+    // team-assigned) bookings for jobsCompleted.
+    const ids = staffList.map((s) => s._id);
+    const [ratingStats, jobCounts] = await Promise.all([
+      getStaffRatingStats(ids),
+      getStaffJobCounts(ids),
+    ]);
+
+    const withStats = staffList.map((s) => {
+      const idStr = String(s._id);
+      const rs = ratingStats.get(idStr);
+      return {
+        _id:           s._id,
+        name:          s.name,
+        rating:        rs ? Math.round(rs.avgRating * 10) / 10 : (s.rating || 0),
+        jobsCompleted: jobCounts.get(idStr) ?? 0,
+        status:        s.isAvailable ? 'Active' : 'Inactive',
+      };
+    });
 
     const summary = {
       totalStaff:     withStats.length,

@@ -1,5 +1,6 @@
 const User    = require('../models/User');
 const Booking = require('../models/Booking');
+const Review  = require('../models/Review');
 
 // ─── GET /api/customers ───────────────────────────────────────────────────────
 // Returns all customers with booking/spend stats, as a bare array.
@@ -77,6 +78,80 @@ const getCustomerById = async (req, res) => {
   }
 };
 
+// ─── GET /api/customers/:id/details ───────────────────────────────────────────
+// Full customer profile for the admin "customer details" view: booking
+// history, payment history, addresses seen on their account/bookings,
+// reviews + average rating, and loyalty tier. Restored from the old
+// customer.controller.js:getDetails — simplified because the new unified
+// Booking model has no legacy serviceItems[] array to branch on.
+const getDetails = async (req, res) => {
+  try {
+    const customer = await User.findOne({ _id: req.params.id, role: 'customer' });
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    const bookings = await Booking.find({ customerId: customer._id }).sort({ createdAt: -1 }).lean();
+
+    const bookingHistory = bookings.map((b) => ({
+      id:     b.bookingId || b._id,
+      service: b.serviceCategory || b.serviceType || b.serviceName || '—',
+      date:   b.date || (b.createdAt ? b.createdAt.toISOString().split('T')[0] : ''),
+      status: (b.status || 'pending').toLowerCase(),
+      amount: b.price || 0,
+    }));
+
+    const completedBookings = bookings.filter(b => (b.status || '').toLowerCase() === 'completed').length;
+    const cancelledBookings = bookings.filter(b => (b.status || '').toLowerCase() === 'cancelled').length;
+    const totalBookings = bookings.length;
+    const totalSpent = bookings.reduce((sum, b) => sum + (b.paidAmount || 0), 0);
+
+    const paymentHistory = bookings
+      .filter(b => (b.paidAmount || 0) > 0)
+      .map((b) => ({
+        id:     b.bookingId || b._id,
+        date:   b.date || '',
+        method: b.paymentMethod || 'Unknown',
+        amount: b.paidAmount || 0,
+        status: b.paymentStatus || 'pending',
+      }));
+
+    // Addresses actually used — the account's saved address plus any
+    // distinct addresses seen on their past bookings.
+    const addressSet = new Set();
+    if (customer.address) addressSet.add(customer.address);
+    for (const b of bookings) if (b.address) addressSet.add(b.address);
+    const addresses = Array.from(addressSet).map(address => ({ address }));
+
+    const reviews = await Review.find({ customerId: customer._id }).sort({ createdAt: -1 }).lean();
+    const averageRating = reviews.length
+      ? Math.round((reviews.reduce((sum, r) => sum + r.rating, 0) / reviews.length) * 10) / 10
+      : null;
+
+    res.json({
+      _id:            customer._id,
+      name:           customer.name,
+      email:          customer.email,
+      phone:          customer.phone || '',
+      address:        customer.address || '',
+      joinDate:       customer.createdAt ? customer.createdAt.toISOString().split('T')[0] : '',
+      customerStatus: customer.status || 'active',
+      loyaltyPoints:  customer.loyaltyPoints || 0,
+      loyaltyTier:    customer.badge || null,
+      totalBookings,
+      totalSpent,
+      completedBookings,
+      cancelledBookings,
+      addresses,
+      bookingHistory,
+      paymentHistory,
+      reviews: reviews.map(r => ({ text: r.content, date: r.createdAt, rating: r.rating })),
+      averageRating,
+    });
+  } catch (err) {
+    console.error('getDetails error:', err);
+    res.status(500).json({ error: 'Failed to load customer details' });
+  }
+};
+
 // ─── PUT /api/customers/:id/status ────────────────────────────────────────────
 const updateCustomerStatus = async (req, res) => {
   try {
@@ -97,4 +172,4 @@ const updateCustomerStatus = async (req, res) => {
   }
 };
 
-module.exports = { getAllCustomers, getCustomerById, updateCustomerStatus };
+module.exports = { getAllCustomers, getCustomerById, getDetails, updateCustomerStatus };

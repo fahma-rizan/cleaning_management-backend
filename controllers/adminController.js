@@ -6,6 +6,7 @@ const toAdminUser = (u) => ({
   email:        u.email,
   phone:        u.phone || '',
   address:      u.address || '',
+  profilePhoto: u.profilePhoto || '',
   adminRole:    u.adminRole || 'Main Admin',
   adminStatus:  u.isActive ? 'Active' : 'Inactive',
   lastActive:   u.updatedAt ? u.updatedAt.toISOString() : '',
@@ -60,6 +61,9 @@ const createAdmin = async (req, res) => {
       role:      'admin',
       adminRole: role,
       isVerified: true,
+      // multer-storage-cloudinary sets req.file.path to the uploaded
+      // image's Cloudinary secure_url.
+      profilePhoto: req.file ? req.file.path : '',
     });
 
     res.status(201).json(toAdminUser(admin));
@@ -81,6 +85,7 @@ const updateAdmin = async (req, res) => {
     if (name)    admin.name      = name;
     if (phone !== undefined)   admin.phone   = phone;
     if (address !== undefined) admin.address = address;
+    if (req.file) admin.profilePhoto = req.file.path; // Cloudinary secure_url
 
     await admin.save();
     res.json(toAdminUser(admin));

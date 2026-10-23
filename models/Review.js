@@ -8,6 +8,13 @@ const reviewSchema = new mongoose.Schema(
     serviceName:  { type: String },
     staffId:      { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     staffName:    { type: String },
+    // For team bookings (Booking.assignedTeam), every team member gets
+    // credit for the same rating — staffId/staffName above hold the first
+    // one for simple/backward-compatible display; staffIds/staffNames hold
+    // the full list so each team member's own rating aggregation includes
+    // this review, not just one arbitrarily-chosen member.
+    staffIds:     [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    staffNames:   [{ type: String }],
 
     rating:  { type: Number, required: true, min: 1, max: 5 },
     content: { type: String, trim: true },

@@ -20,9 +20,24 @@ const Booking   = require('../models/Booking');
 const enrichComplaint = async (complaint) => {
   const obj = complaint.toObject ? complaint.toObject() : complaint;
 
+  // Despite the schema typing bookingId as an ObjectId ref, pre-existing
+  // complaint documents in this database actually store the readable
+  // "BK-..." code as a plain string (e.g. bookingId: 'BK-1786779694685'),
+  // not a Mongo _id. Booking.findById() on a value like that either threw
+  // a CastError (crashing the whole list) or, after the last fix, got
+  // skipped outright — which is why the booking info went blank instead
+  // of just failing to match. Resolving it the same dual-format way
+  // createComplaint/createReview already do — by _id when the value looks
+  // like one, otherwise by the Booking's own bookingId field — picks it
+  // up correctly either way.
+  const rawBookingId = obj.bookingId ? String(obj.bookingId) : null;
+  const isObjectIdFormat = rawBookingId && /^[0-9a-fA-F]{24}$/.test(rawBookingId);
+
   const [customer, booking] = await Promise.all([
     User.findById(obj.customerId).select('email phone'),
-    obj.bookingId ? Booking.findById(obj.bookingId) : null,
+    rawBookingId
+      ? (isObjectIdFormat ? Booking.findById(rawBookingId) : Booking.findOne({ bookingId: rawBookingId }))
+      : null,
   ]);
 
   let serviceStaffName = '';
@@ -56,6 +71,10 @@ const enrichComplaint = async (complaint) => {
 
   return {
     ...obj,
+    // Show the booking's own readable code when we resolved a booking;
+    // otherwise fall back to whatever was already stored on the complaint
+    // (still better than showing nothing) rather than blanking it out.
+    bookingId: booking ? booking.bookingId : rawBookingId,
     customerEmail: customer?.email || '',
     customerPhone: customer?.phone || '',
     serviceStaffName,
@@ -64,6 +83,47 @@ const enrichComplaint = async (complaint) => {
     paidAmount,
     serviceDate,
   };
+};
+
+// ─── GET /api/complaints/assigned ────────────────────────────────────────────
+// Staff: complaints currently assigned to them for resolution.
+const getAssignedComplaints = async (req, res) => {
+  try {
+    const complaints = await Complaint.find({ assignedStaffId: req.user._id })
+      .sort({ createdAt: -1 })
+      .lean();
+    const enriched = await Promise.all(complaints.map(enrichComplaint));
+    res.json({ success: true, complaints: enriched });
+  } catch (err) {
+    console.error('getAssignedComplaints error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load assigned complaints' });
+  }
+};
+
+// ─── PUT /api/complaints/:id/staff-status ────────────────────────────────────
+// Staff can move a complaint assigned to them forward: Pending -> In
+// Progress -> Resolved. Cannot reassign, change priority, or move a
+// complaint backward — those stay admin-only via the existing /status route.
+const updateStatusByStaff = async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!['In Progress', 'Resolved'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Invalid status' });
+    }
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) return res.status(404).json({ success: false, message: 'Complaint not found' });
+    if (String(complaint.assignedStaffId) !== String(req.user._id)) {
+      return res.status(403).json({ success: false, message: 'This complaint is not assigned to you' });
+    }
+
+    complaint.status = status;
+    await complaint.save();
+    res.json({ success: true, complaint });
+  } catch (err) {
+    console.error('updateStatusByStaff error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update status' });
+  }
 };
 
 // ─── POST /api/complaints ──────────────────────────────────────────────────────────
@@ -128,7 +188,15 @@ const getAllComplaints = async (req, res) => {
         { serviceName:  { $regex: search, $options: 'i' } },
       ];
     }
-    const complaints = await Complaint.find(filter).sort({ createdAt: -1 });
+    // .lean() here is required, not just a perf nicety: the schema types
+    // bookingId as ObjectId, but pre-existing documents in this database
+    // store it as a plain "BK-..." string. Without .lean(), Mongoose
+    // hydrates a full Document and casts every field against the schema
+    // on the way — that cast fails silently for these records and drops
+    // bookingId to undefined before enrichComplaint ever sees it, no
+    // matter what lookup logic enrichComplaint has. .lean() returns the
+    // raw stored value untouched.
+    const complaints = await Complaint.find(filter).sort({ createdAt: -1 }).lean();
     const enriched = await Promise.all(complaints.map(enrichComplaint));
     res.json(enriched);
   } catch (err) {
@@ -140,7 +208,7 @@ const getAllComplaints = async (req, res) => {
 // ─── GET /api/complaints/:id ───────────────────────────────────────────────────────
 const getComplaintById = async (req, res) => {
   try {
-    const complaint = await Complaint.findById(req.params.id);
+    const complaint = await Complaint.findById(req.params.id).lean();
     if (!complaint) return res.status(404).json({ error: 'Complaint not found' });
     const enriched = await enrichComplaint(complaint);
     res.json(enriched);
@@ -217,4 +285,5 @@ const addNote = async (req, res) => {
 
 module.exports = {
   createComplaint, getAllComplaints, getComplaintById, updateStatus, updatePriority, assignStaff, addNote,
+  getAssignedComplaints, updateStatusByStaff,
 };

@@ -1,6 +1,7 @@
 const Booking             = require('../models/Booking');
 const User                = require('../models/User');
 const TaskDeclineRequest  = require('../models/TaskDeclineRequest');
+const GpsStatusLog        = require('../models/GpsStatusLog');
 const sendEmail = require('../utils/sendEmail');
 const { getTodayLocalStr } = require('../utils/dateUtils');
 const { awardPointsForBooking } = require('./loyaltyController');
@@ -246,7 +247,21 @@ const getMyBookings = async (req, res) => {
   try {
     const bookings = await Booking.find({ customerId: req.user._id })
       .sort({ createdAt: -1 });
-    res.json({ success: true, bookings });
+
+    // Attach onTheWayAt (if any) so the frontend can treat a 'confirmed'
+    // booking as "ongoing" once staff heads out — without changing the
+    // booking's actual status, which stays reserved for the real
+    // Start Task / Mark Complete lifecycle on the staff side.
+    const bookingIds = bookings.map((b) => b._id);
+    const logs = await GpsStatusLog.find({ bookingId: { $in: bookingIds } });
+    const logByBookingId = new Map(logs.map((l) => [l.bookingId.toString(), l]));
+
+    const enriched = bookings.map((b) => ({
+      ...b.toObject(),
+      onTheWayAt: logByBookingId.get(b._id.toString())?.onTheWayAt || null,
+    }));
+
+    res.json({ success: true, bookings: enriched });
   } catch (err) {
     console.error('getMyBookings error:', err);
     res.status(500).json({ success: false, message: 'Server error. Please try again.' });
@@ -408,6 +423,94 @@ const cancelBooking = async (req, res) => {
   }
 };
 
+// ─── PATCH /api/bookings/:id/on-the-way ──────────────────────────────────────
+// Called when staff confirms "On the Way" in the GPS Navigation modal.
+// Does not change the booking's status (that still happens via startTask) —
+// just logs the moment to the GpsStatusLog history collection.
+const onTheWayTask = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({
+      _id: req.params.id,
+      $or: [
+        { assignedStaffId:        req.user._id },
+        { 'assignedTeam.staffId': req.user._id },
+      ],
+    });
+    if (!booking) return res.status(404).json({ success: false, message: 'Task not found.' });
+
+    await GpsStatusLog.findOneAndUpdate(
+      { bookingId: booking._id },
+      {
+        $set: {
+          staffId:   req.user._id,
+          onTheWayAt: new Date(),
+          latitude:  req.body.latitude,
+          longitude: req.body.longitude,
+        },
+      },
+      { upsert: true },
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('onTheWayTask error:', err);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// ─── GET /api/bookings/:id/tracking ──────────────────────────────────────────
+// Customer-facing: real-time tracking data for a single booking — staff
+// name/phone, live position, and the real On the Way/On Site/Completed
+// timeline. Used by the "Ongoing" tab on the customer dashboard.
+const getBookingTracking = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({
+      _id: req.params.id,
+      customerId: req.user._id,
+    });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+
+    let staff = null;
+    if (booking.assignedStaffId) {
+      staff = await User.findById(booking.assignedStaffId)
+        .select('name phone gpsStatus currentLat currentLng gpsUpdatedAt');
+    }
+
+    const log = await GpsStatusLog.findOne({ bookingId: booking._id });
+
+    res.json({
+      success: true,
+      booking: {
+        _id:             booking._id,
+        bookingId:       booking.bookingId,
+        serviceName:     booking.serviceName,
+        serviceCategory: booking.serviceCategory,
+        address:         booking.address,
+        status:          booking.status,
+        taskStartedAt:   booking.taskStartedAt,
+        taskCompletedAt: booking.taskCompletedAt,
+      },
+      staff: staff ? {
+        staffId:   staff._id,
+        name:      staff.name,
+        phone:     staff.phone || null,
+        latitude:  staff.currentLat,
+        longitude: staff.currentLng,
+        gpsStatus: staff.gpsStatus,
+        updatedAt: staff.gpsUpdatedAt,
+      } : null,
+      timeline: {
+        onTheWayAt:  log?.onTheWayAt || null,
+        onSiteAt:    log?.onSiteAt || booking.taskStartedAt || null,
+        completedAt: log?.completedAt || booking.taskCompletedAt || null,
+      },
+    });
+  } catch (err) {
+    console.error('getBookingTracking error:', err);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
 // ─── PATCH /api/bookings/:id/start ───────────────────────────────────────────
 // Any team member can start — status change is shared (polling syncs other dashboards)
 const startTask = async (req, res) => {
@@ -424,6 +527,13 @@ const startTask = async (req, res) => {
     booking.status        = 'in-progress';
     booking.taskStartedAt = new Date();
     await booking.save();
+
+    GpsStatusLog.findOneAndUpdate(
+      { bookingId: booking._id },
+      { $set: { staffId: req.user._id, onSiteAt: new Date() } },
+      { upsert: true },
+    ).catch((err) => console.error('GpsStatusLog (On Site) error:', err));
+
     res.json({ success: true, booking });
   } catch (err) {
     console.error('startTask error:', err);
@@ -446,6 +556,13 @@ const completeTask = async (req, res) => {
     booking.status          = 'completed';
     booking.taskCompletedAt = new Date();
     await booking.save();
+
+    GpsStatusLog.findOneAndUpdate(
+      { bookingId: booking._id },
+      { $set: { staffId: req.user._id, completedAt: new Date() } },
+      { upsert: true },
+    ).catch((err) => console.error('GpsStatusLog (Completed) error:', err));
+
     res.json({ success: true, booking });
   } catch (err) {
     console.error('completeTask error:', err);
@@ -979,6 +1096,8 @@ module.exports = {
   checkSlotAvailability,
   rescheduleBooking,
   cancelBooking,
+  onTheWayTask,
+  getBookingTracking,
   startTask,
   completeTask,
   markCashReceived,

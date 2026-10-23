@@ -2,6 +2,7 @@ const User    = require('../models/User');
 const Booking = require('../models/Booking');
 const bcrypt  = require('bcryptjs');
 const { getTodayLocalStr } = require('../utils/dateUtils');
+const { getStaffRatingStats, getStaffJobCounts } = require('../utils/staffStats');
 
 const ACTIVE_STATUSES = ['pending', 'confirmed', 'in-progress'];
 
@@ -468,7 +469,7 @@ const updateMyProfile = async (req, res) => {
 // DELETE /api/staff/:id — distinct paths from the routes above so nothing
 // that already depends on /api/staff/all etc. is touched.
 
-const toStaffMember = (s) => ({
+const toStaffMember = (s, stats = {}) => ({
   _id:            s._id,
   name:           s.name,
   email:          s.email,
@@ -476,11 +477,34 @@ const toStaffMember = (s) => ({
   nic:            s.nic || '',
   address:        s.address || '',
   specifications: s.specializations || [],
-  rating:         s.rating || 0,
-  jobsCompleted:  s.jobsCompleted || 0,
+  // Real, live numbers from staffStats.js when available (rating = average
+  // of actual reviews on their bookings, jobsCompleted = count of completed
+  // bookings — both solo and team). Falls back to the stored field only if
+  // the stats lookup didn't cover this staff member.
+  rating:         stats.rating !== undefined ? stats.rating : (s.rating || 0),
+  jobsCompleted:  stats.jobsCompleted !== undefined ? stats.jobsCompleted : (s.jobsCompleted || 0),
   staffStatus:    s.isAvailable ? 'Active' : 'Inactive',
   profilePhoto:   s.profilePhoto || '',
 });
+
+// Attaches live rating/jobsCompleted stats to a list of staff docs in one
+// pair of aggregation queries, instead of the stored (stale) User fields.
+const attachStats = async (staffList) => {
+  const ids = staffList.map((s) => s._id);
+  const [ratingStats, jobCounts] = await Promise.all([
+    getStaffRatingStats(ids),
+    getStaffJobCounts(ids),
+  ]);
+  return staffList.map((s) => {
+    const idStr = String(s._id);
+    const rs = ratingStats.get(idStr);
+    const stats = {
+      jobsCompleted: jobCounts.get(idStr) ?? 0,
+    };
+    if (rs) stats.rating = Math.round(rs.avgRating * 10) / 10;
+    return toStaffMember(s, stats);
+  });
+};
 
 // ─── GET /api/staff ───────────────────────────────────────────────────────────
 const getAllStaffV2 = async (req, res) => {
@@ -497,7 +521,7 @@ const getAllStaffV2 = async (req, res) => {
     if (status && status !== 'All') filter.isAvailable = status === 'Active';
 
     const staffList = await User.find(filter);
-    res.json(staffList.map(toStaffMember));
+    res.json(await attachStats(staffList));
   } catch (err) {
     console.error('getAllStaffV2 error:', err);
     res.status(500).json({ error: 'Failed to load staff' });
@@ -509,7 +533,39 @@ const getStaffByIdV2 = async (req, res) => {
   try {
     const staff = await User.findOne({ _id: req.params.id, role: 'staff' });
     if (!staff) return res.status(404).json({ error: 'Staff not found' });
-    res.json(toStaffMember(staff));
+    const [withStats] = await attachStats([staff]);
+
+    // Completed jobs this staff worked on — as the primary assignee or as
+    // part of the team. Each job is tagged Solo/Group depending on how
+    // many staff total were on that booking. Restored from the old
+    // staff.controller.js:getById — the View Details "Completed Jobs"
+    // list had nothing wired up to it in the new backend.
+    const bookings = await Booking.find({
+      status: 'completed',
+      $or: [
+        { assignedStaffId: staff._id },
+        { 'assignedTeam.staffId': staff._id },
+      ],
+    }).sort({ completedAt: -1, createdAt: -1 }).lean();
+
+    const completedJobs = bookings.map((b) => {
+      const teamIds = new Set(
+        [b.assignedStaffId, ...(b.assignedTeam || []).map((t) => t.staffId)]
+          .filter(Boolean)
+          .map(String),
+      );
+      return {
+        bookingId: b.bookingId,
+        service: b.serviceCategory || b.serviceType || b.serviceName || '—',
+        customerName: b.customerName || '—',
+        date: b.completedAt
+          ? new Date(b.completedAt).toISOString().split('T')[0]
+          : (b.date || (b.createdAt ? new Date(b.createdAt).toISOString().split('T')[0] : '')),
+        jobType: teamIds.size > 1 ? 'Group' : 'Solo',
+      };
+    });
+
+    res.json({ ...withStats, completedJobs });
   } catch (err) {
     console.error('getStaffByIdV2 error:', err);
     res.status(500).json({ error: 'Failed to load staff member' });
@@ -520,7 +576,7 @@ const getStaffByIdV2 = async (req, res) => {
 const getAvailableStaffV2 = async (req, res) => {
   try {
     const staffList = await User.find({ role: 'staff', isAvailable: true });
-    res.json(staffList.map(toStaffMember));
+    res.json(await attachStats(staffList));
   } catch (err) {
     console.error('getAvailableStaffV2 error:', err);
     res.status(500).json({ error: 'Failed to load available staff' });
@@ -530,7 +586,12 @@ const getAvailableStaffV2 = async (req, res) => {
 // ─── POST /api/staff (multipart/form-data) ────────────────────────────────────
 const createStaffV2 = async (req, res) => {
   try {
-    const { name, email, phone, nic, address, specifications, status } = req.body;
+    // Field is "specializations" on both the form (StaffManagement.tsx
+    // sends fd.append("specializations", ...)) and the User schema — was
+    // destructured here as "specifications" (no such key in the request
+    // body), so this always fell through to an empty array on create and
+    // silently no-op'd on update.
+    const { name, email, phone, nic, address, specializations, status } = req.body;
     if (!name || !email || !phone) {
       return res.status(400).json({ error: 'Name, email and phone are required.' });
     }
@@ -540,7 +601,7 @@ const createStaffV2 = async (req, res) => {
 
     const nameParts = name.trim().split(' ');
     let parsedSpecs = [];
-    try { parsedSpecs = specifications ? JSON.parse(specifications) : []; } catch { parsedSpecs = []; }
+    try { parsedSpecs = specializations ? JSON.parse(specializations) : []; } catch { parsedSpecs = []; }
 
     const staff = await User.create({
       firstName: nameParts[0],
@@ -556,7 +617,9 @@ const createStaffV2 = async (req, res) => {
       requiresPasswordChange: true,
       isAvailable: status !== 'Inactive',
       specializations: parsedSpecs,
-      profilePhoto: req.file ? `/uploads/staff/${req.file.filename}` : '',
+      // multer-storage-cloudinary sets req.file.path to the uploaded
+      // image's Cloudinary secure_url (was a local /uploads/staff/... path).
+      profilePhoto: req.file ? req.file.path : '',
     });
 
     res.status(201).json(toStaffMember(staff));
@@ -572,7 +635,7 @@ const updateStaffV2 = async (req, res) => {
     const staff = await User.findOne({ _id: req.params.id, role: 'staff' });
     if (!staff) return res.status(404).json({ error: 'Staff not found' });
 
-    const { name, email, phone, nic, address, specifications, status } = req.body;
+    const { name, email, phone, nic, address, specializations, status } = req.body;
     if (name) {
       const parts = name.trim().split(' ');
       staff.firstName = parts[0];
@@ -583,11 +646,11 @@ const updateStaffV2 = async (req, res) => {
     if (phone)   staff.phone   = phone;
     if (nic !== undefined)     staff.nic     = nic;
     if (address !== undefined) staff.address = address;
-    if (specifications !== undefined) {
-      try { staff.specializations = JSON.parse(specifications); } catch { /* keep existing */ }
+    if (specializations !== undefined) {
+      try { staff.specializations = JSON.parse(specializations); } catch { /* keep existing */ }
     }
     if (status !== undefined) staff.isAvailable = status !== 'Inactive';
-    if (req.file) staff.profilePhoto = `/uploads/staff/${req.file.filename}`;
+    if (req.file) staff.profilePhoto = req.file.path; // Cloudinary secure_url
 
     await staff.save();
     res.json(toStaffMember(staff));

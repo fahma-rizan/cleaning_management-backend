@@ -78,15 +78,18 @@ const validateOffer = async (req, res) => {
     if (!offer) return res.status(404).json({ message: 'Invalid promo code' });
     if (!isCurrentlyValid(offer)) return res.status(400).json({ message: 'This promo code has expired' });
 
+    // applicableServices is now an array of numeric service IDs (matching
+    // Settings.priceLists' serviceId) instead of category strings with an
+    // 'all' sentinel — empty array means "applies to every service".
     const applies =
-      offer.applicableServices.includes('all') ||
-      offer.applicableServices.includes(String(serviceId));
+      offer.applicableServices.length === 0 ||
+      offer.applicableServices.includes(Number(serviceId));
     if (!applies) return res.status(400).json({ message: 'This promo code does not apply to this service' });
 
     const amount = Number(orderAmount) || 0;
-    if (offer.minAmount && amount < offer.minAmount) {
+    if (offer.minOrderAmount && amount < offer.minOrderAmount) {
       return res.status(400).json({
-        message: `Minimum booking amount for this code is LKR ${offer.minAmount.toLocaleString()}`,
+        message: `Minimum booking amount for this code is LKR ${offer.minOrderAmount.toLocaleString()}`,
       });
     }
 

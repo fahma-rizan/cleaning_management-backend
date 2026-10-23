@@ -1,4 +1,6 @@
 const User = require('../models/User');
+const Booking = require('../models/Booking');
+const { getTodayLocalStr } = require('../utils/dateUtils');
 
 const toCleaner = (u) => ({
   _id:             u._id,
@@ -25,6 +27,36 @@ const getActiveCleaners = async (req, res) => {
   } catch (err) {
     console.error('getActiveCleaners error:', err);
     res.status(500).json({ error: 'Failed to load active cleaners' });
+  }
+};
+
+// ─── GET /api/gps/completed-today ────────────────────────────────────────────
+// Completed jobs are a booking-lifecycle concept, not a live-tracking one —
+// so this queries Booking directly rather than anything GPS-status-based.
+// Kept in this controller (rather than bookingController) since it's
+// specifically for the admin GPS Tracking page's "Completed" stat/cards.
+const getCompletedToday = async (req, res) => {
+  try {
+    const today = getTodayLocalStr();
+    const bookings = await Booking.find({
+      status: 'completed',
+      date: today,
+    }).sort({ taskCompletedAt: -1 });
+
+    res.json(
+      bookings.map((b) => ({
+        _id:              b._id,
+        bookingId:        b.bookingId,
+        serviceName:      b.serviceName,
+        customerName:     b.customerName,
+        address:          b.address,
+        assignedStaffName: b.assignedStaffName,
+        taskCompletedAt:  b.taskCompletedAt,
+      })),
+    );
+  } catch (err) {
+    console.error('getCompletedToday error:', err);
+    res.status(500).json({ error: 'Failed to load completed jobs' });
   }
 };
 
@@ -60,4 +92,4 @@ const updateStatus = async (req, res) => {
   }
 };
 
-module.exports = { getActiveCleaners, updateStatus };
+module.exports = { getActiveCleaners, getCompletedToday, updateStatus };

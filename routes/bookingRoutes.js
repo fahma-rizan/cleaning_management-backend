@@ -16,6 +16,8 @@ const {
   checkSlotAvailability,
   rescheduleBooking,
   cancelBooking,
+  onTheWayTask,
+  getBookingTracking,
   startTask,
   completeTask,
   markCashReceived,
@@ -55,6 +57,8 @@ router.post('/:bookingId/request-reschedule', protect, requestReschedule);
 router.post('/:bookingId/request-cancel',     protect, requestCancel);
 router.patch('/:id/reschedule',        protect, validate(rescheduleSchema), rescheduleBooking);
 router.patch('/:id/cancel',            protect, validate(cancelSchema), cancelBooking);
+router.patch('/:id/on-the-way',        protect, onTheWayTask);
+router.get('/:id/tracking',            protect, getBookingTracking);
 router.patch('/:id/start',             protect, startTask);
 router.patch('/:id/complete',          protect, completeTask);
 router.patch('/:id/cash-received',     protect, markCashReceived);
