@@ -108,6 +108,9 @@ app.use('/api/notification-templates', require('./routes/notificationTemplates')
 app.use('/api/payment-report',         require('./routes/paymentReport'));
 app.use('/api/payment-reminders',      require('./routes/paymentReminders'));
 app.use('/api/assistant',              require('./routes/assistantRoutes'));
+// Customer-facing AI service finder (ported from feature/services-page-v2) —
+// needs GROQ_API_KEY; the frontend falls back to its rule-based replies without it.
+app.use('/api/chatbot',                require('./routes/chatbotRoutes'));
 
 // Health check - open this in browser to confirm server is working
 app.get('/api/health', (req, res) => {
