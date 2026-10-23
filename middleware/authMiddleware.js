@@ -22,6 +22,14 @@ const protect = async (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user      = await User.findById(decoded.id).select('-password');
+
+    // Covers deleted/deactivated accounts (see authController.deleteAccount) —
+    // a still-unexpired JWT issued before deletion would otherwise keep
+    // working against every protected route for up to 30 days.
+    if (!req.user || req.user.isActive === false) {
+      return res.status(401).json({ success: false, message: 'Not authorized, account is inactive.' });
+    }
+
     return next();
   } catch (error) {
     return res.status(401).json({ success: false, message: 'Not authorized, token failed.' });

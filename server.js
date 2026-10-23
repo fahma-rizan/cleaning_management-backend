@@ -1,3 +1,4 @@
+const dns = require('dns');
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
@@ -7,6 +8,13 @@ const { Server } = require('socket.io');
 const connectDB = require('./config/db');
 
 dotenv.config();
+
+// This machine/network resolves outbound hosts (e.g. www.googleapis.com) to
+// an IPv6 address that times out, even though IPv4 to the same host works
+// fine — seen breaking Google Sign-In token verification with
+// "connect ETIMEDOUT 2001:...:443". Preferring IPv4 results avoids it for
+// every outbound request this process makes (Google, Cloudinary, PayHere...).
+dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 const server = http.createServer(app);
@@ -113,4 +121,10 @@ server.listen(PORT, () => {
 
   // Automatic balance-due reminder emails — ported from backend-payment-workflow.
   require('./utils/reminderScheduler').startReminderScheduler();
+
+  // Annual loyalty points expiry — see utils/loyalty.cron.js.
+  require('./utils/loyalty.cron').startLoyaltyCron();
+
+  // Overdue material-usage-report reminders — see utils/completionReportReminder.cron.js.
+  require('./utils/completionReportReminder.cron').startCompletionReportReminderCron();
 });

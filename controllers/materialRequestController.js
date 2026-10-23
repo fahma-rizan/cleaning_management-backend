@@ -1,31 +1,33 @@
 const MaterialRequest = require('../models/MaterialRequest');
-const Booking = require('../models/Booking');
+const { confirmMaterialRequest } = require('../services/materialRequestService');
 
 const toResponse = (req) => {
   const b = req.bookingId || {};
   return {
     _id: req._id,
     bookingId: {
+      _id:          b._id || '',
       bookingRef:   b.bookingId || '',
-      customerId:   { name: b.customerName || '' },
+      customerName: b.customerName || '',
       scheduledDate: b.date || '',
       serviceType:  b.serviceCategory || b.serviceName || '',
-      usageFactor:       b.houseSize ? 'house_size' : (b.mattressCount ? 'mattress_count' : ''),
-      usageFactorValue:  b.houseSize || b.mattressCount || b.sofaSeatingCapacity || '',
     },
+    serviceId: req.serviceId,
     items: req.items,
     status: req.status,
-    rejectionReason: req.rejectionReason,
+    cancelledAfterConfirmation: req.cancelledAfterConfirmation,
     createdAt: req.createdAt,
   };
 };
 
 // ─── GET /api/material-requests ────────────────────────────────────────────────
+// status is optional — 'all' (or omitted) returns every request, matching the
+// Material Requests tab's All/Pending/Confirmed/Cancelled sub-tabs.
 const getRequests = async (req, res) => {
   try {
     const { status } = req.query;
     const filter = {};
-    if (status) filter.status = status;
+    if (status && status !== 'all') filter.status = status;
 
     const requests = await MaterialRequest.find(filter)
       .populate('bookingId')
@@ -50,37 +52,21 @@ const getRequestByBooking = async (req, res) => {
   }
 };
 
-// ─── POST /api/material-requests/:id/approve ───────────────────────────────────
-const approveRequest = async (req, res) => {
+// ─── POST /api/material-requests/:id/confirm ───────────────────────────────────
+// No reject flow — low stock is surfaced as a non-blocking `warnings` array,
+// the request always ends up confirmed and stock is always deducted.
+const confirmRequest = async (req, res) => {
   try {
-    const request = await MaterialRequest.findByIdAndUpdate(
-      req.params.id,
-      { status: 'approved', approvedAt: new Date() },
-      { new: true }
-    ).populate('bookingId');
-    if (!request) return res.status(404).json({ error: 'Request not found' });
-    res.json(toResponse(request));
+    const { request, warnings } = await confirmMaterialRequest(req.params.id);
+    const populated = await request.populate('bookingId');
+    res.json({ ...toResponse(populated), warnings });
   } catch (err) {
-    console.error('approveRequest error:', err);
-    res.status(500).json({ error: 'Failed to approve request' });
+    console.error('confirmRequest error:', err);
+    const status = err.message === 'Material request not found' ? 404
+      : err.message === 'Only pending material requests can be confirmed' ? 400
+      : 500;
+    res.status(status).json({ error: status === 500 ? 'Failed to confirm request' : err.message });
   }
 };
 
-// ─── POST /api/material-requests/:id/reject ────────────────────────────────────
-const rejectRequest = async (req, res) => {
-  try {
-    const { reason } = req.body;
-    const request = await MaterialRequest.findByIdAndUpdate(
-      req.params.id,
-      { status: 'rejected', rejectionReason: reason || '' },
-      { new: true }
-    ).populate('bookingId');
-    if (!request) return res.status(404).json({ error: 'Request not found' });
-    res.json(toResponse(request));
-  } catch (err) {
-    console.error('rejectRequest error:', err);
-    res.status(500).json({ error: 'Failed to reject request' });
-  }
-};
-
-module.exports = { getRequests, getRequestByBooking, approveRequest, rejectRequest };
+module.exports = { getRequests, getRequestByBooking, confirmRequest };

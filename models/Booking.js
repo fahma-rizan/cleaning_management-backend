@@ -23,10 +23,22 @@ const bookingSchema = new mongoose.Schema(
     customerEmail: { type: String },
 
     // — Service info ———————————————————————————————————————————————————————————
-    serviceId:       { type: String },
+    // Number, matching services.serviceId / consumptionrates.serviceId — was
+    // String before, which meant it only worked against those collections by
+    // relying on Mongoose's implicit query-side cast.
+    serviceId:       { type: Number },
     serviceName:     { type: String, required: true },
     serviceType:     { type: String }, // e.g. 'Home/Office Cleaning'
     serviceCategory: { type: String }, // e.g. 'House Deep Cleaning'
+    // Home-cleaning sub-service/pricing-tier picked on the booking form
+    // (id values from pricelists.pricing.types[].id: 'normal' |
+    // 'move-in-out' | 'after-construction' for House Deep Cleaning /
+    // Commercial Cleaning; 'general' | 'floor' | 'cut-polish' for the other
+    // Home/Office services). The booking form has always sent this, but the
+    // schema never declared it — same class of bug as the squareFeet fix
+    // below, silently dropped by Mongoose strict mode. Needed now to resolve
+    // the correct `consumptionrates` variant for material-request generation.
+    cleaningType: { type: String, trim: true },
 
     // — Schedule ———————————————————————————————————————————————————————————————
     date:    { type: String },  // YYYY-MM-DD
@@ -34,9 +46,20 @@ const bookingSchema = new mongoose.Schema(
     address: { type: String, required: true },
 
     // — Pricing ————————————————————————————————————————————————————————————————
-    price:         { type: Number, default: 0 },
+    price:         { type: Number, default: 0 }, // final payable total — after tier discount AND points discount, if any
     paidAmount:    { type: Number, default: 0 },
     balanceAmount: { type: Number, default: 0 },
+
+    // — Loyalty discounts applied at checkout ———————————————————————————————————
+    // originalPrice is the pre-loyalty-discount total; price above is what's
+    // left after both. Kept for display/audit (invoices, history) — loyalty
+    // points are earned on the actual amount paid (see processSuccessfulPayment
+    // in loyaltyController.js), not derived from these.
+    originalPrice:       { type: Number },
+    tierDiscountApplied: { type: Boolean, default: false },
+    tierDiscountAmount:  { type: Number, default: 0 }, // Rs value of the one-time tier perk, if used
+    pointsRedeemed:       { type: Number, default: 0 }, // points spent on this booking
+    pointsDiscountAmount: { type: Number, default: 0 }, // Rs value of that redemption (1:1)
 
     // — Status ————————————————————————————————————————————————————————————————
     status: {
@@ -148,12 +171,21 @@ const bookingSchema = new mongoose.Schema(
     mattressSquareFeet:  { type: Number },
     // Staff count for mattress cleaning is driven by size, not the existing
     // mattressCount pricing field — added alongside it, doesn't touch pricing.
+    // Also doubles as the per-mattress consumption-rate input: materialRequestService
+    // looks these up case-insensitively against consumptionrates.sizeVariants
+    // (which store size lowercase: king/queen/double/single) — kept
+    // capitalized here since MATTRESS_STAFF_BY_SIZE in bookingController.js
+    // already depends on this exact casing.
     mattressSize:          { type: String, enum: ['Single', 'Double', 'Queen', 'King'] },
     mattressCleaningLevel: { type: String, enum: ['Full', 'Top Only'] },
     carpetCount:         { type: Number },
     carpetSquareFeet:    { type: Number },
 
     // — Misc ——————————————————————————————————————————————————————————————————
+    // Informational cache of total points earned across all of this booking's
+    // payments — NOT the source of truth for reversal (that's computed from
+    // the LoyaltyTransaction history, since one booking can have several
+    // independent successful payments). Handy for admin/reporting display.
     loyaltyPointsEarned: { type: Number, default: 0 },
     cancelledAt:         { type: Date },
     completedAt:         { type: Date },

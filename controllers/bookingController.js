@@ -1,9 +1,31 @@
 const Booking             = require('../models/Booking');
 const User                = require('../models/User');
+const Payment              = require('../models/Payment');
 const TaskDeclineRequest  = require('../models/TaskDeclineRequest');
+const ConsumptionRate     = require('../models/ConsumptionRate');
+const MaterialRequest     = require('../models/MaterialRequest');
+const CompletionReport    = require('../models/CompletionReport');
 const sendEmail = require('../utils/sendEmail');
 const { getTodayLocalStr, addWorkingDays } = require('../utils/dateUtils');
-const { awardPointsForBooking } = require('./loyaltyController');
+const { processSuccessfulPayment, reversePointsForBooking, withPaymentRetry } = require('./loyaltyController');
+const {
+  generateMaterialRequest,
+  handleBookingCancellation,
+} = require('../services/materialRequestService');
+
+// Only these booking.cleaningType values are actually a consumptionrates
+// `variant` — kept in sync with services/materialRequestService.js's own copy.
+const VALID_RATE_VARIANTS = ['normal', 'move-in-out', 'after-construction'];
+
+// Which booking field is required for a given service's unitBasis, so a
+// booking can't be created missing the number materialRequestService needs.
+// per_mattress needs both mattressSize and mattressCleaningLevel, so it's
+// checked separately below rather than through this map.
+const REQUIRED_FIELD_BY_UNIT_BASIS = {
+  per_100_sqft: 'squareFeet',
+  per_seat:     'sofaSeatingCapacity',
+  per_curtain:  'curtainQuantity',
+};
 
 // Keep in sync with TIME_SLOTS in validators/bookingValidators.js.
 // 30-minute gap between every slot.
@@ -348,6 +370,36 @@ const createBooking = async (req, res) => {
       }
     }
 
+    // Consumption-factor validation — if the selected service has a
+    // material consumption rate, make sure the field it needs was actually
+    // submitted, so materialRequestService always has what it needs later.
+    // Only enforced when serviceId is present and resolves to a rate at
+    // all — a booking without a resolvable serviceId/rate proceeds as
+    // before (material request generation below just no-ops for it).
+    if (data.serviceId !== undefined && data.serviceId !== null && data.serviceId !== '') {
+      const rate = await ConsumptionRate.findOne({
+        serviceId: Number(data.serviceId),
+        variant: VALID_RATE_VARIANTS.includes(data.cleaningType) ? data.cleaningType : null,
+        isActive: true,
+      });
+
+      if (rate && rate.unitBasis !== 'none') {
+        if (rate.unitBasis === 'per_mattress') {
+          if (!data.mattressSize) {
+            return res.status(400).json({ success: false, message: 'mattressSize is required for this service.' });
+          }
+          if (!data.mattressCleaningLevel) {
+            return res.status(400).json({ success: false, message: 'mattressCleaningLevel is required for this service.' });
+          }
+        } else {
+          const requiredField = REQUIRED_FIELD_BY_UNIT_BASIS[rate.unitBasis];
+          if (requiredField && !data[requiredField]) {
+            return res.status(400).json({ success: false, message: `${requiredField} is required for this service.` });
+          }
+        }
+      }
+    }
+
     const booking = await Booking.create({
       ...data,
       customerId:    req.user._id,
@@ -361,10 +413,69 @@ const createBooking = async (req, res) => {
       await autoAssignBooking(booking);
     }
 
-    res.status(201).json({ success: true, booking });
+    // Auto-generate the material request right away — materials need to be
+    // planned for the physical job regardless of payment method/status (a
+    // COD booking can otherwise sit at status 'pending' indefinitely).
+    // Never blocks booking creation: a failure here is logged, not thrown.
+    try {
+      await generateMaterialRequest(booking);
+    } catch (mrErr) {
+      console.error('generateMaterialRequest error:', mrErr);
+    }
+
+    // The checkout flow (online/advance-balance gateway, or an immediate
+    // cash confirmation) resolves payment BEFORE the booking is saved here,
+    // so this is the actual payment-success point for that path — create a
+    // real Payment record and award loyalty points for it. (A later separate
+    // payment on the same booking — e.g. a cash top-up for the remaining
+    // balance, or a PayHere IPN call — is handled at its own point instead:
+    // markCashReceived / payhereController's notify().)
+    let loyalty = null;
+    if (data.paidAmount > 0) {
+      try {
+        // Each step retries independently on a transient DB/network blip
+        // (rather than surfacing "payment confirmed, but we could not
+        // credit your loyalty points" for something that would have
+        // succeeded a moment later) — but NOT as a single retried block:
+        // if Payment.create() already succeeded and only the award step
+        // failed, retrying Payment.create() too would create a second
+        // Payment record for the same money and double-count the points.
+        const payment = await withPaymentRetry(() => Payment.create({
+          bookingId:  booking._id,
+          customerId: req.user._id,
+          amount:     data.paidAmount,
+          method:     paymentMethodToPaymentModel(booking.paymentMethod),
+          status:     'paid',
+          paidAt:     new Date(),
+        }));
+        loyalty = await withPaymentRetry(() => processSuccessfulPayment({
+          userId:      req.user._id,
+          bookingId:   booking._id,
+          paymentId:   payment._id,
+          amountPaid:  data.paidAmount,
+        }));
+      } catch (loyaltyErr) {
+        console.error('processSuccessfulPayment (createBooking) error:', loyaltyErr);
+      }
+    }
+
+    res.status(201).json({ success: true, booking, loyalty });
   } catch (err) {
     console.error('createBooking error:', err);
     res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// Maps the Booking model's paymentMethod enum onto Payment's own (narrower,
+// pre-existing) method enum.
+const paymentMethodToPaymentModel = (method) => {
+  switch (method) {
+    case 'full-online':
+    case 'card':
+    case 'online': return 'online';
+    case 'advance-balance': return 'advance';
+    case 'pay-after-completion': return 'pay-after-completion';
+    default: return 'cod';
   }
 };
 
@@ -403,12 +514,28 @@ const getAssignedBookings = async (req, res) => {
       status:    'pending',
     }).select('bookingId');
     const pendingDeclineIds = new Set(pendingDeclines.map(d => d.bookingId.toString()));
+    // Only a completed booking can ever have a material-usage action to
+    // show — batch-check just those for a confirmed MaterialRequest (i.e.
+    // there's something to reconcile) and an existing CompletionReport.
+    const completedIds = raw.filter(b => b.status === 'completed').map(b => b._id);
+    const [confirmedRequests, existingReports] = await Promise.all([
+      MaterialRequest.find({ bookingId: { $in: completedIds }, status: 'confirmed' }).select('bookingId'),
+      CompletionReport.find({ bookingId: { $in: completedIds } }).select('bookingId'),
+    ]);
+    const hasConfirmedRequestSet = new Set(confirmedRequests.map(r => r.bookingId.toString()));
+    const hasReportSet           = new Set(existingReports.map(r => r.bookingId.toString()));
 
     const bookings = raw.map(b => {
       const hasTeam = b.assignedTeam && b.assignedTeam.length > 0;
+      const idStr = b._id.toString();
+      const hasCompletionReport = hasReportSet.has(idStr);
+      // Hides the action once ANY co-assigned staff member has submitted
+      // (regardless of who), and for bookings with nothing to reconcile
+      // (e.g. laundry — no consumables, no MaterialRequest was ever made).
+      const canRecordMaterialUsage = b.status === 'completed' && hasConfirmedRequestSet.has(idStr) && !hasCompletionReport;
       return {
-        _id:           b._id.toString(),
-        id:            b._id.toString(),
+        _id:           idStr,
+        id:            idStr,
         bookingId:     b.bookingId,
         customer:      b.customerName   || 'N/A',
         service:       b.serviceName    || b.serviceCategory || 'N/A',
@@ -436,6 +563,8 @@ const getAssignedBookings = async (req, res) => {
         isPickupStaff:      !!(b.assignedStaffId && b.assignedStaffId.toString() === req.user._id.toString()),
         isDeliveryStaff:    !!(b.deliveryStaffId && b.deliveryStaffId.toString() === req.user._id.toString()),
         hasPendingDecline:  pendingDeclineIds.has(b._id.toString()),
+        hasCompletionReport,
+        canRecordMaterialUsage,
       };
     });
 
@@ -548,6 +677,23 @@ const cancelBooking = async (req, res) => {
       : undefined;
 
     await booking.save();
+
+    // Every cancellation type reverses points earned on the booking —
+    // currentBalance is reduced first (any shortfall becomes loyaltyDebt),
+    // and lifetimePoints/tier are recalculated down too. Non-fatal: a
+    // reversal failure shouldn't block the cancellation itself.
+    try {
+      await reversePointsForBooking(booking._id, `Booking ${booking.bookingId} cancelled by customer — points reversed`);
+    } catch (loyaltyErr) {
+      console.error('reversePointsForBooking (customer cancel) error:', loyaltyErr);
+    }
+
+    try {
+      await handleBookingCancellation(booking._id);
+    } catch (mrErr) {
+      console.error('handleBookingCancellation (customer cancel) error:', mrErr);
+    }
+
     res.json({ success: true, booking });
   } catch (err) {
     console.error('cancelBooking error:', err);
@@ -654,10 +800,20 @@ const updateLaundryStatus = async (req, res) => {
 
     if (stage === 'completed') {
       // Non-fatal if it fails — mirrors markCashReceived's pattern above.
+      // Points are earned per Payment (processSuccessfulPayment is idempotent
+      // on paymentId), so this only awards payments not already processed.
       try {
-        await awardPointsForBooking(booking.customerId, booking.paidAmount || booking.price, booking._id, booking.bookingId);
+        const payments = await Payment.find({ bookingId: booking._id, status: 'paid' });
+        for (const payment of payments) {
+          await withPaymentRetry(() => processSuccessfulPayment({
+            userId:     booking.customerId,
+            bookingId:  booking._id,
+            paymentId:  payment._id,
+            amountPaid: payment.amount,
+          }));
+        }
       } catch (loyaltyErr) {
-        console.error('awardPointsForBooking (laundry completed) error:', loyaltyErr);
+        console.error('processSuccessfulPayment (laundry completed) error:', loyaltyErr);
       }
     }
 
@@ -681,14 +837,32 @@ const markCashReceived = async (req, res) => {
     if (!booking) return res.status(404).json({ success: false, message: 'Task not found.' });
 
     booking.paymentStatus = 'paid';
-    if (!booking.paidAmount) booking.paidAmount = booking.price || 0;
+    // Only actually a new payment event when paidAmount wasn't already set —
+    // this both preserves the existing no-op-on-repeat-call behavior and is
+    // exactly the condition under which real new money was just collected.
+    const isNewPayment = !booking.paidAmount;
+    if (isNewPayment) booking.paidAmount = booking.price || 0;
     await booking.save();
 
-    // Award loyalty points for the payment — non-fatal if it fails.
-    try {
-      await awardPointsForBooking(booking.customerId, booking.paidAmount, booking._id, booking.bookingId);
-    } catch (loyaltyErr) {
-      console.error('awardPointsForBooking (cash-received) error:', loyaltyErr);
+    if (isNewPayment && booking.paidAmount > 0) {
+      try {
+        const payment = await withPaymentRetry(() => Payment.create({
+          bookingId:  booking._id,
+          customerId: booking.customerId,
+          amount:     booking.paidAmount,
+          method:     'cod',
+          status:     'paid',
+          paidAt:     new Date(),
+        }));
+        await withPaymentRetry(() => processSuccessfulPayment({
+          userId:     booking.customerId,
+          bookingId:  booking._id,
+          paymentId:  payment._id,
+          amountPaid: booking.paidAmount,
+        }));
+      } catch (loyaltyErr) {
+        console.error('processSuccessfulPayment (cash-received) error:', loyaltyErr);
+      }
     }
 
     res.json({ success: true, booking });
@@ -1114,13 +1288,21 @@ const getCancelInfo = async (req, res) => {
 };
 
 // ─── POST /api/bookings/cancel ──────────────────────────────────────────────────
-// Public. Body: { token, reason }
+// Public. Body: { token, reason }. Reached only via the link emailed by
+// requestCancel() — i.e. the company decided to cancel this booking and is
+// notifying the customer; this just confirms it. Loyalty points earned on
+// the booking are reversed here exactly the same as cancelBooking() below —
+// every cancellation type reverses points, with no exception for a
+// company-initiated cancellation.
 const confirmCancel = async (req, res) => {
   try {
     const { token, reason } = req.body;
     const booking = await Booking.findOne({ bookingId: token });
     if (!booking) return res.status(404).json({ msg: 'Booking not found.' });
     if (booking.status === 'cancelled') return res.status(400).json({ msg: 'Booking is already cancelled.' });
+    // Materials are physically used once a job is completed — mirrors the
+    // same guard cancelBooking() already has on the customer-facing path.
+    if (booking.status === 'completed') return res.status(400).json({ msg: 'Cannot cancel a completed booking.' });
 
     const scheduled = new Date(`${booking.date} ${booking.time || '00:00'}`);
     const minutesBeforeService = isNaN(scheduled.getTime())
@@ -1132,6 +1314,18 @@ const confirmCancel = async (req, res) => {
     booking.cancellationReason  = reason;
     booking.minutesBeforeService = minutesBeforeService;
     await booking.save();
+
+    try {
+      await reversePointsForBooking(booking._id, `Booking ${booking.bookingId} cancelled — points reversed`);
+    } catch (loyaltyErr) {
+      console.error('reversePointsForBooking (confirmCancel) error:', loyaltyErr);
+    }
+
+    try {
+      await handleBookingCancellation(booking._id);
+    } catch (mrErr) {
+      console.error('handleBookingCancellation (confirmCancel) error:', mrErr);
+    }
 
     res.json({ success: true, booking });
   } catch (err) {

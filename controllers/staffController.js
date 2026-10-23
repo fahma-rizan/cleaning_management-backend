@@ -124,7 +124,9 @@ const toggleAvailability = async (req, res) => {
 };
 
 // ─── POST /api/staff/create  (admin only) ────────────────────────────────────
-// Admin creates a new staff account with temp password staff123
+// Admin creates a new staff account. Password is never taken from the
+// request — createOnboardedUser generates a secure random one server-side,
+// emails it, and flags the account to force a real password on first login.
 const createStaff = async (req, res) => {
   try {
     const { fullName, email, phone, nic, address, specifications, status } = req.body;
@@ -132,6 +134,8 @@ const createStaff = async (req, res) => {
     if (!fullName || !email || !phone) {
       return res.status(400).json({ success: false, message: 'Full name, email and phone are required.' });
     }
+    if (!isValidEmail(email)) return res.status(400).json({ success: false, message: EMAIL_RULE });
+    if (!isValidPhone(phone)) return res.status(400).json({ success: false, message: PHONE_RULE });
 
     const existing = await User.findOne({ email: email.toLowerCase() });
     if (existing) {
@@ -142,25 +146,22 @@ const createStaff = async (req, res) => {
     const firstName  = nameParts[0];
     const lastName   = nameParts.slice(1).join(' ') || firstName;
 
-    const newStaff = await User.create({
+    const newStaff = await createOnboardedUser({
       firstName,
       lastName,
-      name:                  fullName.trim(),
-      email:                 email.toLowerCase(),
+      name:            fullName.trim(),
+      email:           email.toLowerCase(),
       phone,
-      nic:                   nic   || '',
-      address:               address || '',
-      password:              'staff123',      // temporary — must change on first login
-      role:                  'staff',
-      isVerified:            true,
-      requiresPasswordChange: true,
-      isAvailable:           status === 'Active',
-      specializations:       specifications || [],
-    });
+      nic:             nic   || '',
+      address:         address || '',
+      role:            'staff',
+      isAvailable:     status === 'Active',
+      specializations: specifications || [],
+    }, { portalLabel: 'Staff' });
 
     res.status(201).json({
       success: true,
-      message: `Staff account created. Temporary password is: staff123`,
+      message: 'Staff account created. Login credentials have been emailed to them.',
       staff: {
         _id:         newStaff._id,
         name:        newStaff.name,
@@ -563,12 +564,10 @@ const createStaffV2 = async (req, res) => {
       address:   address || '',
       password:  tempPassword,
       role:      'staff',
-      isVerified: true,
-      requiresPasswordChange: true,
       isAvailable: status !== 'Inactive',
       specializations: parsedSpecs,
       profilePhoto: req.file ? `/uploads/staff/${req.file.filename}` : '',
-    });
+    }, { portalLabel: 'Staff' });
 
     const emailed = await sendEmail({
       to: staff.email,

@@ -42,6 +42,9 @@ const getAdminById = async (req, res) => {
 };
 
 // ─── POST /api/admins ───────────────────────────────────────────────────────────
+// Password is never taken from the request — createOnboardedUser generates a
+// secure random one server-side, emails it, and flags the account to force a
+// real password on first login. Same shared function Staff Management uses.
 const createAdmin = async (req, res) => {
   try {
     const { name, email, address, nic, role } = req.body;
@@ -55,6 +58,8 @@ const createAdmin = async (req, res) => {
       phone = normalizePhone(rawPhone);
       if (!phone) return res.status(400).json({ error: PHONE_RULE });
     }
+    if (!isValidEmail(email)) return res.status(400).json({ error: EMAIL_RULE });
+    if (phone && !isValidPhone(phone)) return res.status(400).json({ error: PHONE_RULE });
 
     const existing = await User.findOne({ email: email.toLowerCase() });
     if (existing) return res.status(400).json({ error: 'An account with this email already exists.' });
